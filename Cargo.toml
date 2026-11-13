@@ -1,0 +1,9 @@
+[package]
+name = "test_compute"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "24"
+pollster = "0.4"
+bytemuck = { version = "1.21", features = ["derive"] }

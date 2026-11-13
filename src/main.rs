@@ -1,5 +1,11 @@
+mod bench;
 mod matrix_multiplier;
 use matrix_multiplier::{MatrixMultiplier, PipelineMode, MAX_DIMENSION};
+use std::time::{Duration, Instant};
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}
 
 fn cpu_matrix_multiply(a: &[f32], b: &[f32], m: usize, k_dim: usize, n: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
@@ -35,6 +41,10 @@ fn print_matrix(mat: &[f32], rows: usize, cols: usize) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("bench") {
+        return bench::run();
+    }
+
     println!("Matrix Size Limit: Max dimension = {MAX_DIMENSION}");
 
     let selected_mode = PipelineMode::Tiled;
@@ -62,8 +72,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         5.0, 6.0, 7.0, 8.0,
     ];
 
+    let cpu_start = Instant::now();
     let cpu_expected = cpu_matrix_multiply(&matrix_a, &matrix_b, m, k, n);
-    let gpu_result = pollster::block_on(engine.multiply(&matrix_a, &matrix_b, m, k, n))?;
+    let cpu_time = cpu_start.elapsed();
+
+    let gpu_start = Instant::now();
+    let gpu_run = pollster::block_on(engine.multiply_timed(&matrix_a, &matrix_b, m, k, n))?;
+    let gpu_wall = gpu_start.elapsed();
+    let gpu_result = gpu_run.output;
 
     println!("\n--- Matrix A ({m}x{k}) ---");
     print_matrix(&matrix_a, m, k);
@@ -81,6 +97,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Computation failed verification: GPU result differs from CPU".into());
     }
     println!("\nSUCCESS: GPU computation matches CPU calculation!");
+
+    println!("\n--- Timing ---");
+    println!("CPU multiply:           {:>10.3} ms", ms(cpu_time));
+    println!("GPU total (wall):       {:>10.3} ms  (upload + dispatch + readback)", ms(gpu_wall));
+    match gpu_run.kernel_time {
+        Some(t) => println!("GPU kernel (on-device): {:>10.3} ms", ms(t)),
+        None => println!("GPU kernel (on-device):        n/a  (adapter lacks TIMESTAMP_QUERY)"),
+    }
+    println!("Run `cargo run --release -- bench` to time larger matrices.");
 
     Ok(())
 }
@@ -114,16 +139,30 @@ mod tests {
         (64, 130, 31),
     ];
 
-    fn check_mode(mode: PipelineMode) {
+    /// Only one GPU device may exist at a time: opening several at once
+    /// (cargo runs tests in parallel threads) crashes the Intel UHD 630 driver.
+    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `f` with a fresh engine while holding [`GPU_LOCK`]; the engine
+    /// (and its device) is dropped before the lock is released.
+    fn with_engine(mode: PipelineMode, f: impl FnOnce(&MatrixMultiplier)) {
+        // A panicking test poisons the lock; the GPU is still usable afterwards.
+        let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let engine = pollster::block_on(MatrixMultiplier::new(mode)).expect("GPU init failed");
-        for (i, &(m, k, n)) in SHAPES.iter().enumerate() {
-            let a = test_matrix(m * k, 2 * i as u32 + 1);
-            let b = test_matrix(k * n, 2 * i as u32 + 2);
-            let expected = cpu_matrix_multiply(&a, &b, m, k, n);
-            let got = pollster::block_on(engine.multiply(&a, &b, m, k, n))
-                .unwrap_or_else(|e| panic!("{mode:?} {m}x{k}x{n}: {e}"));
-            assert!(approx_eq(&got, &expected), "{mode:?} mismatch for {m}x{k}x{n}");
-        }
+        f(&engine);
+    }
+
+    fn check_mode(mode: PipelineMode) {
+        with_engine(mode, |engine| {
+            for (i, &(m, k, n)) in SHAPES.iter().enumerate() {
+                let a = test_matrix(m * k, 2 * i as u32 + 1);
+                let b = test_matrix(k * n, 2 * i as u32 + 2);
+                let expected = cpu_matrix_multiply(&a, &b, m, k, n);
+                let got = pollster::block_on(engine.multiply(&a, &b, m, k, n))
+                    .unwrap_or_else(|e| panic!("{mode:?} {m}x{k}x{n}: {e}"));
+                assert!(approx_eq(&got, &expected), "{mode:?} mismatch for {m}x{k}x{n}");
+            }
+        });
     }
 
     #[test]
@@ -138,12 +177,12 @@ mod tests {
 
     #[test]
     fn rejects_bad_input() {
-        let engine =
-            pollster::block_on(MatrixMultiplier::new(PipelineMode::Tiled)).expect("GPU init failed");
-        let one = [1.0f32];
-        assert!(pollster::block_on(engine.multiply(&one, &one, 0, 1, 1)).is_err());
-        assert!(pollster::block_on(engine.multiply(&one, &one, 2, 1, 1)).is_err());
-        let too_big = MAX_DIMENSION + 1;
-        assert!(pollster::block_on(engine.multiply(&one, &one, too_big, 1, 1)).is_err());
+        with_engine(PipelineMode::Tiled, |engine| {
+            let one = [1.0f32];
+            assert!(pollster::block_on(engine.multiply(&one, &one, 0, 1, 1)).is_err());
+            assert!(pollster::block_on(engine.multiply(&one, &one, 2, 1, 1)).is_err());
+            let too_big = MAX_DIMENSION + 1;
+            assert!(pollster::block_on(engine.multiply(&one, &one, too_big, 1, 1)).is_err());
+        });
     }
 }

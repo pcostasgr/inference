@@ -1,5 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use std::mem::size_of;
+use std::time::Duration;
 use wgpu::util::DeviceExt;
 
 /// Maximum dimension allowed for any axis (M, K, N).
@@ -32,6 +33,14 @@ pub enum PipelineMode {
 
 type BoxError = Box<dyn std::error::Error>;
 
+/// Result of a GPU multiply, with the kernel's on-GPU execution time when available.
+pub struct GpuRun {
+    pub output: Vec<f32>,
+    /// Time the compute pass took on the GPU, measured with timestamp queries.
+    /// `None` if the adapter doesn't support `TIMESTAMP_QUERY`.
+    pub kernel_time: Option<Duration>,
+}
+
 /// Reusable GPU engine that holds the GPU device, queue, and a single chosen compute pipeline.
 pub struct MatrixMultiplier {
     device: wgpu::Device,
@@ -39,6 +48,8 @@ pub struct MatrixMultiplier {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     adapter_info: wgpu::AdapterInfo,
+    /// Two-entry timestamp query set (pass begin/end), if supported.
+    query_set: Option<wgpu::QuerySet>,
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -85,9 +96,30 @@ impl MatrixMultiplier {
             .ok_or("Failed to find an appropriate GPU adapter")?;
         let adapter_info = adapter.get_info();
 
+        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = if timestamps {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    required_features,
+                    ..Default::default()
+                },
+                None,
+            )
             .await?;
+
+        let query_set = timestamps.then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("Kernel Timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            })
+        });
 
         let (label, body) = match mode {
             PipelineMode::Naive => ("Naive Matrix Multiply Shader", include_str!("shader.wgsl")),
@@ -144,6 +176,7 @@ impl MatrixMultiplier {
             pipeline,
             bind_group_layout,
             adapter_info,
+            query_set,
         })
     }
 
@@ -152,8 +185,14 @@ impl MatrixMultiplier {
         &self.adapter_info
     }
 
+    /// Whether `multiply_timed` can report on-GPU kernel time.
+    pub fn has_kernel_timer(&self) -> bool {
+        self.query_set.is_some()
+    }
+
     /// Multiplies matrix `A` (m x k) and matrix `B` (k x n) using the active pipeline.
     /// Validates dimensions against MAX_DIMENSION and slice lengths.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn multiply(
         &self,
         matrix_a: &[f32],
@@ -162,6 +201,18 @@ impl MatrixMultiplier {
         k: usize,
         n: usize,
     ) -> Result<Vec<f32>, BoxError> {
+        Ok(self.multiply_timed(matrix_a, matrix_b, m, k, n).await?.output)
+    }
+
+    /// Like [`multiply`](Self::multiply), but also returns the GPU kernel time.
+    pub async fn multiply_timed(
+        &self,
+        matrix_a: &[f32],
+        matrix_b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<GpuRun, BoxError> {
         if m == 0 || k == 0 || n == 0 {
             return Err("Matrix dimensions must be non-zero".into());
         }
@@ -250,9 +301,17 @@ impl MatrixMultiplier {
         });
 
         {
+            let timestamp_writes =
+                self.query_set
+                    .as_ref()
+                    .map(|query_set| wgpu::ComputePassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    });
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Matrix Multiply Pass"),
-                timestamp_writes: None,
+                timestamp_writes,
             });
 
             compute_pass.set_pipeline(&self.pipeline);
@@ -265,29 +324,72 @@ impl MatrixMultiplier {
 
         encoder.copy_buffer_to_buffer(&c_buffer, 0, &staging_buffer, 0, c_buffer_size);
 
+        // Resolve the two u64 timestamps and copy them somewhere mappable.
+        const TS_BYTES: u64 = 2 * size_of::<u64>() as u64;
+        let ts_staging = self.query_set.as_ref().map(|query_set| {
+            let resolve = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Timestamp Resolve Buffer"),
+                size: TS_BYTES,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Timestamp Staging Buffer"),
+                size: TS_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.resolve_query_set(query_set, 0..2, &resolve, 0);
+            encoder.copy_buffer_to_buffer(&resolve, 0, &staging, 0, TS_BYTES);
+            staging
+        });
+
         self.queue.submit(Some(encoder.finish()));
 
-        let buffer_slice = staging_buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            // The receiver only disappears if we've already returned; nothing to do then.
-            let _ = tx.send(result);
-        });
+        let result_rx = map_read(&staging_buffer);
+        let ts_rx = ts_staging.as_ref().map(map_read);
 
         let _ = self.device.poll(wgpu::Maintain::wait());
 
         // Always pop the scopes so they don't leak, and report GPU errors first:
         // they explain a failed map better than the map error itself.
         pop_error_scopes(&self.device).await?;
-        rx.recv()
-            .map_err(|_| "Buffer map callback was never invoked")?
-            .map_err(|e| format!("Failed to map staging buffer: {e}"))?;
 
-        let data = buffer_slice.get_mapped_range();
-        let result_c: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-        staging_buffer.unmap();
+        let output = read_mapped::<f32>(&staging_buffer, result_rx)?;
+        let kernel_time = match (ts_staging.as_ref(), ts_rx) {
+            (Some(buf), Some(rx)) => {
+                let ts = read_mapped::<u64>(buf, rx)?;
+                let ticks = ts[1].checked_sub(ts[0]);
+                let period_ns = self.queue.get_timestamp_period() as f64;
+                ticks.map(|t| Duration::from_nanos((t as f64 * period_ns) as u64))
+            }
+            _ => None,
+        };
 
-        Ok(result_c)
+        Ok(GpuRun { output, kernel_time })
     }
+}
+
+type MapReceiver = std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>;
+
+/// Starts mapping the whole buffer for reading; completes on the next `device.poll`.
+fn map_read(buffer: &wgpu::Buffer) -> MapReceiver {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+        // The receiver only disappears if we've already returned; nothing to do then.
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// Waits for a [`map_read`] to finish, copies the contents out and unmaps.
+fn read_mapped<T: Pod>(buffer: &wgpu::Buffer, rx: MapReceiver) -> Result<Vec<T>, BoxError> {
+    rx.recv()
+        .map_err(|_| "Buffer map callback was never invoked")?
+        .map_err(|e| format!("Failed to map staging buffer: {e}"))?;
+    let data = buffer.slice(..).get_mapped_range();
+    let out = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    buffer.unmap();
+    Ok(out)
 }

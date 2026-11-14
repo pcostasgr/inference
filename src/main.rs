@@ -376,7 +376,7 @@ mod tests {
     /// Random network with the given widths: ReLU on hidden layers, none on the
     /// output. Weights are scaled by 1/sqrt(inputs) so activations stay around 1
     /// through the chain instead of growing layer by layer.
-    fn random_net(widths: &[usize], seed: u32) -> Vec<mlp::DenseLayer> {
+    fn random_net(widths: &[usize], seed: u32, hidden: mlp::Activation) -> Vec<mlp::DenseLayer> {
         let last = widths.len() - 2;
         widths
             .windows(2)
@@ -390,7 +390,7 @@ mod tests {
                     bias: test_matrix(outputs, s + 1),
                     inputs,
                     outputs,
-                    activation: if i == last { mlp::Activation::None } else { mlp::Activation::Relu },
+                    activation: if i == last { mlp::Activation::None } else { hidden },
                 }
             })
             .collect()
@@ -406,24 +406,54 @@ mod tests {
         (5, &[7, 130, 1, 20, 9]),
     ];
 
+    /// Every shape, once with ReLU hidden layers and once with sigmoid.
     #[test]
     fn mlp_forward_matches_cpu() {
         with_engine(PipelineMode::Tiled, |engine| {
-            for (i, &(batch, widths)) in MLP_SHAPES.iter().enumerate() {
-                let layers = random_net(widths, 300 + 50 * i as u32);
-                let input = test_matrix(batch * widths[0], 900 + i as u32);
+            for hidden in [mlp::Activation::Relu, mlp::Activation::Sigmoid] {
+                for (i, &(batch, widths)) in MLP_SHAPES.iter().enumerate() {
+                    let layers = random_net(widths, 300 + 50 * i as u32, hidden);
+                    let input = test_matrix(batch * widths[0], 900 + i as u32);
 
-                let expected = mlp::cpu_forward(&layers, &input, batch).unwrap();
-                let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
-                let got = pollster::block_on(net.forward(&input, batch))
-                    .unwrap_or_else(|e| panic!("forward {widths:?} batch {batch}: {e}"))
-                    .output;
+                    let expected = mlp::cpu_forward(&layers, &input, batch).unwrap();
+                    let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
+                    let got = pollster::block_on(net.forward(&input, batch))
+                        .unwrap_or_else(|e| panic!("{hidden:?} {widths:?} batch {batch}: {e}"))
+                        .output;
 
-                assert!(
-                    approx_eq(&got, &expected),
-                    "GPU/CPU mismatch for widths {widths:?}, batch {batch}"
-                );
+                    assert!(
+                        approx_eq(&got, &expected),
+                        "GPU/CPU mismatch for {hidden:?} hidden layers, widths {widths:?}, batch {batch}"
+                    );
+                }
             }
+        });
+    }
+
+    /// One 1 -> 2 sigmoid layer, so each output is sigmoid(x - 2) and sigmoid(2 - x):
+    /// exact midpoint, ordinary values, and inputs far past the clamp.
+    #[test]
+    fn mlp_forward_sigmoid_values() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            let layers = [mlp::DenseLayer {
+                weights: vec![1.0, -1.0],
+                bias: vec![-2.0, 2.0],
+                inputs: 1,
+                outputs: 2,
+                activation: mlp::Activation::Sigmoid,
+            }];
+            let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
+
+            // x = 2 -> pre-activations [0, 0]; x = 0 -> [-2, 2];
+            // x = +-1000 -> far beyond the +-30 clamp (saturates, no NaN).
+            let input = [2.0, 0.0, 1000.0, -1000.0];
+            let out = pollster::block_on(net.forward(&input, 4)).unwrap().output;
+
+            assert_eq!(&out[0..2], &[0.5, 0.5], "sigmoid(0) must be exactly 0.5");
+            assert!(out.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)), "{out:?}");
+            assert!(approx_eq(&out, &mlp::cpu_forward(&layers, &input, 4).unwrap()), "{out:?}");
+            assert!(out[4] > 0.999_999 && out[5] < 1e-6, "large x must saturate: {out:?}");
+            assert!(out[6] < 1e-6 && out[7] > 0.999_999, "small x must saturate: {out:?}");
         });
     }
 

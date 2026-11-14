@@ -33,7 +33,13 @@ timestamp queries when the GPU supports them.
 ### MLP inference chain (`src/mlp.rs`)
 
 A small multi-layer perceptron. Each layer computes `Y = act(X·W + bias)`, where
-`act` is ReLU or none.
+`act` is one of:
+
+- `None`: the raw value.
+- `Relu`: `max(v, 0)`.
+- `Sigmoid`: `1 / (1 + e^-v)`, squashing values into (0, 1). The input is clamped to
+  ±30 first (on both GPU and CPU). Beyond that the result is already 0 or 1 in f32,
+  and the clamp keeps `exp` from overflowing.
 
 - `Mlp::new` checks that the layer shapes chain together, then **uploads the
   weights once**. Later inference calls reuse them.
@@ -96,7 +102,7 @@ src/
   shader.wgsl           naive multiply (+ optional D)
   shader_tiled.wgsl     tiled multiply (+ optional D)
   shader_add.wgsl       element-wise add
-  shader_dense.wgsl     tiled dense layer: X·W + bias, then ReLU or none
+  shader_dense.wgsl     tiled dense layer: X·W + bias, then none, ReLU or sigmoid
 ```
 
 All shaders share one bind-group layout: a uniform with the dimensions, inputs A

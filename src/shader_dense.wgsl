@@ -1,4 +1,4 @@
-// Dense (fully connected) layer: Y = act(X * W + bias)
+// Dense (fully connected) layer: Y = act(X * W + bias), act = none | ReLU | sigmoid
 //   X: M x K   (batch x inputs)       row-major
 //   W: K x N   (inputs x outputs)     row-major
 //   bias: N, broadcast over every row
@@ -10,8 +10,12 @@ struct Params {
     M: u32,
     K: u32,
     N: u32,
-    activation: u32, // 0 = none, 1 = ReLU
+    activation: u32, // 0 = none, 1 = ReLU, 2 = sigmoid
 }
+
+// Must match SIGMOID_CLAMP in mlp.rs. Beyond +-30 sigmoid is 0 or 1 in f32,
+// and clamping keeps exp() from overflowing (undefined in WGSL).
+const SIGMOID_CLAMP: f32 = 30.0;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
@@ -62,6 +66,9 @@ fn main(
         var v = acc + bias[col];
         if (params.activation == 1u) {
             v = max(v, 0.0);
+        } else if (params.activation == 2u) {
+            let c = clamp(v, -SIGMOID_CLAMP, SIGMOID_CLAMP);
+            v = 1.0 / (1.0 + exp(-c));
         }
         Y[row * params.N + col] = v;
     }

@@ -35,7 +35,16 @@ type BoxError = Box<dyn std::error::Error>;
 pub enum Activation {
     None = 0,
     Relu = 1,
+    /// `1 / (1 + e^-v)`, squashing any value into (0, 1).
+    // Part of the API; only the tests use it so far (the demo uses ReLU).
+    #[allow(dead_code)]
+    Sigmoid = 2,
 }
+
+/// Sigmoid input is clamped to this range on both GPU and CPU. Outside it the
+/// result is already 0 or 1 to f32 precision, and clamping keeps `exp` from
+/// overflowing, which WGSL leaves undefined.
+pub const SIGMOID_CLAMP: f32 = 30.0;
 
 impl Activation {
     /// The code the dense shader expects in its uniform.
@@ -48,6 +57,10 @@ impl Activation {
         match self {
             Activation::None => v,
             Activation::Relu => v.max(0.0),
+            Activation::Sigmoid => {
+                let v = v.clamp(-SIGMOID_CLAMP, SIGMOID_CLAMP);
+                1.0 / (1.0 + (-v).exp())
+            }
         }
     }
 }
@@ -537,8 +550,23 @@ mod tests {
     fn activation_codes_and_cpu_apply() {
         assert_eq!(Activation::None.shader_code(), 0);
         assert_eq!(Activation::Relu.shader_code(), 1);
+        assert_eq!(Activation::Sigmoid.shader_code(), 2);
         assert_eq!(Activation::Relu.apply(-2.0), 0.0);
         assert_eq!(Activation::Relu.apply(3.0), 3.0);
         assert_eq!(Activation::None.apply(-2.0), -2.0);
+    }
+
+    #[test]
+    fn sigmoid_cpu_values() {
+        let s = |v| Activation::Sigmoid.apply(v);
+        assert_eq!(s(0.0), 0.5);
+        // sigmoid(ln 3) = 1 / (1 + 1/3) = 0.75
+        assert!((s(3.0f32.ln()) - 0.75).abs() < 1e-6);
+        // Symmetry: sigmoid(-v) = 1 - sigmoid(v)
+        assert!((s(-1.5) - (1.0 - s(1.5))).abs() < 1e-6);
+        // Extreme inputs saturate without overflow or NaN.
+        assert_eq!(s(1e30), 1.0);
+        assert!(s(-1e30) >= 0.0 && s(-1e30) < 1e-12);
+        assert!(!s(f32::MAX).is_nan() && !s(f32::MIN).is_nan());
     }
 }

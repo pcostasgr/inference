@@ -9,10 +9,11 @@
 //! whole network in a single GPU submission: activations ping-pong between two
 //! buffers, one dispatch per layer, and only the final layer is read back.
 //!
-//! [`Mlp::forward_dual`] does the same with "dual bind groups" (dual descriptor
-//! sets): each layer's constants are bound once in `Mlp::new`, and the
-//! ping-pong pair is two prebuilt bind groups (ping->pong, pong->ping) cached
-//! per batch size, so a repeated call only uploads input, submits and reads back.
+//! Bindings use "dual bind groups" (dual descriptor sets), split by how often
+//! they change:
+//! - group 1, per layer: params, weights and bias, built once in `Mlp::new`
+//! - group 0, activations: two prebuilt sets (ping->pong and pong->ping) that
+//!   alternate layer by layer, cached with their buffers per batch size
 
 use crate::matrix_multiplier::{
     pop_error_scopes, push_error_scopes, GpuRun, MatrixMultiplier, MAX_DIMENSION, WORKGROUP_SIZE,
@@ -21,32 +22,22 @@ use bytemuck::{Pod, Zeroable};
 use std::mem::size_of;
 use wgpu::util::DeviceExt;
 
-/// Matches `struct Params` in `shader_dense.wgsl` (16 bytes).
+/// Matches `struct LayerParams` in `shader_dense.wgsl` / `shader_softmax.wgsl`
+/// (group 1, binding 0). Has no batch size, so it never changes after `Mlp::new`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct DenseParams {
-    m: u32,
-    k: u32,
-    n: u32,
-    activation: u32,
-}
-
-/// Matches `struct LayerParams` in the `*_dual.wgsl` shaders (group 1, binding 0).
-/// Has no batch size, so it never changes after `Mlp::new`.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct DualLayerParams {
+struct LayerParams {
     k: u32,
     n: u32,
     activation: u32,
     _pad: u32,
 }
 
-/// Matches `struct Batch` in the `*_dual.wgsl` shaders (group 0, binding 2),
-/// padded to 16 bytes.
+/// Matches `struct Batch` in the same shaders (group 0, binding 2), padded to
+/// 16 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct DualBatch {
+struct BatchParams {
     m: u32,
     _pad: [u32; 3],
 }
@@ -231,19 +222,20 @@ pub fn cpu_forward(layers: &[DenseLayer], input: &[f32], batch: usize) -> Result
 struct GpuLayer {
     weights: wgpu::Buffer,
     bias: wgpu::Buffer,
-    /// Dual layout, group 1: params + weights + bias, built once in `Mlp::new`.
-    dual_group: wgpu::BindGroup,
+    /// Bind group 1: params + weights + bias, built once in `Mlp::new`.
+    group: wgpu::BindGroup,
     inputs: usize,
     outputs: usize,
     activation: Activation,
 }
 
-/// The ping-pong pair for [`Mlp::forward_dual`], built for one batch size and
-/// reused by every call with that batch size.
-struct DualActivations {
+/// The ping-pong pair, built for one batch size and reused by every
+/// [`Mlp::forward`] call with that batch size.
+struct Activations {
     batch: usize,
     ping: wgpu::Buffer,
     pong: wgpu::Buffer,
+    /// Bind group 0, two variants:
     /// `sets[0]` = { in: ping, out: pong } for even layers,
     /// `sets[1]` = { in: pong, out: ping } for odd layers.
     sets: [wgpu::BindGroup; 2],
@@ -254,13 +246,14 @@ struct DualActivations {
 pub struct Mlp<'e> {
     engine: &'e MatrixMultiplier,
     layers: Vec<GpuLayer>,
-    /// Cached ping-pong pair for `forward_dual`; rebuilt when the batch changes.
-    dual: Option<DualActivations>,
+    /// Cached ping-pong pair; rebuilt when the batch size changes.
+    activations: Option<Activations>,
 }
 
 impl<'e> Mlp<'e> {
-    /// Validates `layers` and uploads every weight matrix and bias vector to the
-    /// GPU of `engine`. GPU errors (e.g. out of memory) are returned as `Err`.
+    /// Validates `layers`, uploads every weight matrix and bias vector to the
+    /// GPU of `engine`, and builds each layer's bind group. GPU errors (e.g. out
+    /// of memory) are returned as `Err`.
     pub async fn new(engine: &'e MatrixMultiplier, layers: &[DenseLayer]) -> Result<Self, BoxError> {
         validate_layers(layers)?;
 
@@ -282,20 +275,20 @@ impl<'e> Mlp<'e> {
                 let bias = upload("Bias", &layer.bias);
 
                 // Everything about this layer that never changes, bound once.
-                let params = DualLayerParams {
+                let params = LayerParams {
                     k: layer.inputs as u32,
                     n: layer.outputs as u32,
                     activation: layer.activation.shader_code(),
                     _pad: 0,
                 };
                 let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("Layer {i} Dual Params")),
+                    label: Some(&format!("Layer {i} Params")),
                     contents: bytemuck::bytes_of(&params),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-                let dual_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("Layer {i} Dual Group (group 1)")),
-                    layout: &engine.dual_layer_layout,
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("Layer {i} (group 1)")),
+                    layout: &engine.layer_layout,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: weights.as_entire_binding() },
@@ -306,7 +299,7 @@ impl<'e> Mlp<'e> {
                 GpuLayer {
                     weights,
                     bias,
-                    dual_group,
+                    group,
                     inputs: layer.inputs,
                     outputs: layer.outputs,
                     activation: layer.activation,
@@ -319,13 +312,13 @@ impl<'e> Mlp<'e> {
         Ok(Self {
             engine,
             layers: gpu_layers,
-            dual: None,
+            activations: None,
         })
     }
 
-    /// Batch size the cached `forward_dual` ping-pong pair was built for, if any.
-    pub fn dual_cached_batch(&self) -> Option<usize> {
-        self.dual.as_ref().map(|d| d.batch)
+    /// Batch size the cached ping-pong pair was built for, if any.
+    pub fn cached_batch(&self) -> Option<usize> {
+        self.activations.as_ref().map(|a| a.batch)
     }
 
     pub fn num_layers(&self) -> usize {
@@ -360,19 +353,77 @@ impl<'e> Mlp<'e> {
     ///
     /// Everything happens in one submission:
     /// 1. upload the input into the `ping` buffer
-    /// 2. layer i reads one buffer and writes the other (ping -> pong -> ping ...);
-    ///    wgpu makes each dispatch wait for the previous one's writes
+    /// 2. layer i reads one buffer and writes the other (ping -> pong -> ping ...),
+    ///    by binding activation set `i % 2` and its own layer group; wgpu makes
+    ///    each dispatch wait for the previous one's writes
     /// 3. read back only the buffer the last layer wrote
     ///
+    /// The ping-pong buffers and their two bind groups are cached per batch
+    /// size (hence `&mut self`): a call with the same batch size as the last one
+    /// builds no activation buffers or bind groups. It still allocates the
+    /// small readback and timestamp staging buffers in `run_pass`.
+    ///
     /// `kernel_time` covers the whole chain of layers on the GPU.
-    pub async fn forward(&self, input: &[f32], batch: usize) -> Result<GpuRun, BoxError> {
+    pub async fn forward(&mut self, input: &[f32], batch: usize) -> Result<GpuRun, BoxError> {
         self.check_input(input, batch)?;
 
         let engine = self.engine;
-        let device = &engine.device;
-        push_error_scopes(device);
+        push_error_scopes(&engine.device);
 
-        // Two activation buffers, each big enough for the widest layer.
+        if self.cached_batch() != Some(batch) {
+            self.activations = Some(self.build_activations(batch));
+        }
+        let output_size = self.output_size();
+        let (layers, acts) = (&self.layers, self.activations.as_ref().expect("built above"));
+
+        // Staged now, executed at the start of the submit in run_pass. The
+        // previous call already waited for its readback, so ping is free.
+        engine.queue.write_buffer(&acts.ping, 0, bytemuck::cast_slice(input));
+
+        // Even layers write pong, odd layers write ping.
+        let last = layers.len() - 1;
+        let output = if last.is_multiple_of(2) { &acts.pong } else { &acts.ping };
+
+        let result = engine
+            .run_pass(
+                |pass| {
+                    for (i, layer) in layers.iter().enumerate() {
+                        pass.set_bind_group(0, &acts.sets[i % 2], &[]);
+                        pass.set_bind_group(1, &layer.group, &[]);
+
+                        pass.set_pipeline(&engine.dense_pipeline);
+                        pass.dispatch_workgroups(
+                            (layer.outputs as u32).div_ceil(WORKGROUP_SIZE),
+                            (batch as u32).div_ceil(WORKGROUP_SIZE),
+                            1,
+                        );
+
+                        // Softmax needs whole rows: the dense shader wrote raw
+                        // values, now normalize them in place, one workgroup
+                        // per row, with the same two groups.
+                        if layer.activation == Activation::Softmax {
+                            pass.set_pipeline(&engine.softmax_pipeline);
+                            pass.dispatch_workgroups(1, batch as u32, 1);
+                        }
+                    }
+                },
+                output,
+                batch * output_size,
+            )
+            .await;
+
+        // If the GPU reported an error (e.g. out of memory while building the
+        // pair), don't keep possibly invalid buffers around for the next call.
+        if result.is_err() {
+            self.activations = None;
+        }
+        result
+    }
+
+    /// Creates the ping and pong buffers for `batch` rows of the widest layer,
+    /// the batch-size uniform, and the two activation bind groups.
+    fn build_activations(&self, batch: usize) -> Activations {
+        let device = &self.engine.device;
         let act_bytes = (batch * self.max_width() * size_of::<f32>()) as u64;
         let make_act = |label: &str| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -387,171 +438,16 @@ impl<'e> Mlp<'e> {
         let ping = make_act("Activations Ping");
         let pong = make_act("Activations Pong");
 
-        // Staged now, executed at the start of the submit in run_pass.
-        engine.queue.write_buffer(&ping, 0, bytemuck::cast_slice(input));
-
-        // One params uniform + bind group per layer. Even layers read ping and
-        // write pong; odd layers the reverse.
-        let bind_groups: Vec<wgpu::BindGroup> = self
-            .layers
-            .iter()
-            .enumerate()
-            .map(|(i, layer)| {
-                let (src, dst) = if i.is_multiple_of(2) { (&ping, &pong) } else { (&pong, &ping) };
-                let params = DenseParams {
-                    m: batch as u32,
-                    k: layer.inputs as u32,
-                    n: layer.outputs as u32,
-                    activation: layer.activation.shader_code(),
-                };
-                let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("Layer {i} Params")),
-                    contents: bytemuck::bytes_of(&params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("Layer {i} Bind Group")),
-                    layout: &engine.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: layer.weights.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: dst.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 4, resource: layer.bias.as_entire_binding() },
-                    ],
-                })
-            })
-            .collect();
-
-        let last = self.layers.len() - 1;
-        // Same parity rule as above: the last layer wrote pong if its index is even.
-        let output = if last.is_multiple_of(2) { &pong } else { &ping };
-
-        engine
-            .run_pass(
-                |pass| {
-                    for (layer, bind_group) in self.layers.iter().zip(&bind_groups) {
-                        pass.set_bind_group(0, bind_group, &[]);
-
-                        pass.set_pipeline(&engine.dense_pipeline);
-                        pass.dispatch_workgroups(
-                            (layer.outputs as u32).div_ceil(WORKGROUP_SIZE),
-                            (batch as u32).div_ceil(WORKGROUP_SIZE),
-                            1,
-                        );
-
-                        // Softmax needs whole rows: the dense shader wrote raw
-                        // values, now normalize them in place, one workgroup per
-                        // row. Same bind group (params + this layer's output);
-                        // wgpu makes it wait for the dense dispatch's writes.
-                        if layer.activation == Activation::Softmax {
-                            pass.set_pipeline(&engine.softmax_pipeline);
-                            pass.dispatch_workgroups(1, batch as u32, 1);
-                        }
-                    }
-                },
-                output,
-                batch * self.output_size(),
-            )
-            .await
-    }
-
-    /// Same result as [`forward`](Self::forward), using dual bind groups.
-    ///
-    /// - Per-layer constants (params, weights, bias) are bind group 1, built
-    ///   once in `Mlp::new`.
-    /// - The activations are bind group 0: two prebuilt sets, ping->pong and
-    ///   pong->ping, cached with their buffers for the current batch size.
-    ///
-    /// So a call with the same batch size as the last one creates no buffers
-    /// or bind groups: it uploads the input, records `set_bind_group` +
-    /// dispatch per layer, submits once and reads back. A new batch size
-    /// rebuilds the pair once. Needs `&mut self` to update that cache.
-    pub async fn forward_dual(&mut self, input: &[f32], batch: usize) -> Result<GpuRun, BoxError> {
-        self.check_input(input, batch)?;
-
-        let engine = self.engine;
-        let device = &engine.device;
-        push_error_scopes(device);
-
-        if self.dual_cached_batch() != Some(batch) {
-            self.dual = Some(self.build_dual_activations(batch));
-        }
-        let output_size = self.output_size();
-        let (layers, dual) = (&self.layers, self.dual.as_ref().expect("built above"));
-
-        // Staged now, executed at the start of the submit in run_pass. The
-        // previous call already waited for its readback, so ping is free.
-        engine.queue.write_buffer(&dual.ping, 0, bytemuck::cast_slice(input));
-
-        let last = layers.len() - 1;
-        let output = if last.is_multiple_of(2) { &dual.pong } else { &dual.ping };
-
-        let result = engine
-            .run_pass(
-                |pass| {
-                    for (i, layer) in layers.iter().enumerate() {
-                        // The two prebuilt activation sets alternate; the
-                        // layer's own group was built in Mlp::new.
-                        pass.set_bind_group(0, &dual.sets[i % 2], &[]);
-                        pass.set_bind_group(1, &layer.dual_group, &[]);
-
-                        pass.set_pipeline(&engine.dense_dual_pipeline);
-                        pass.dispatch_workgroups(
-                            (layer.outputs as u32).div_ceil(WORKGROUP_SIZE),
-                            (batch as u32).div_ceil(WORKGROUP_SIZE),
-                            1,
-                        );
-
-                        // Same groups: softmax normalizes this layer's output
-                        // (group 0's out buffer) in place, one workgroup per row.
-                        if layer.activation == Activation::Softmax {
-                            pass.set_pipeline(&engine.softmax_dual_pipeline);
-                            pass.dispatch_workgroups(1, batch as u32, 1);
-                        }
-                    }
-                },
-                output,
-                batch * output_size,
-            )
-            .await;
-
-        // If the GPU reported an error (e.g. out of memory while building the
-        // pair), don't keep possibly invalid buffers around for the next call.
-        if result.is_err() {
-            self.dual = None;
-        }
-        result
-    }
-
-    /// Creates the ping and pong buffers for `batch` rows of the widest layer,
-    /// the batch-size uniform, and the two activation bind groups.
-    fn build_dual_activations(&self, batch: usize) -> DualActivations {
-        let device = &self.engine.device;
-        let act_bytes = (batch * self.max_width() * size_of::<f32>()) as u64;
-        let make_act = |label: &str| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: act_bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
-        let ping = make_act("Dual Activations Ping");
-        let pong = make_act("Dual Activations Pong");
-
         let batch_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Dual Batch Size"),
-            contents: bytemuck::bytes_of(&DualBatch { m: batch as u32, _pad: [0; 3] }),
+            label: Some("Batch Size"),
+            contents: bytemuck::bytes_of(&BatchParams { m: batch as u32, _pad: [0; 3] }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
         let make_set = |label: &str, input: &wgpu::Buffer, output: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
-                layout: &self.engine.dual_act_layout,
+                layout: &self.engine.act_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
@@ -560,14 +456,13 @@ impl<'e> Mlp<'e> {
             })
         };
         let sets = [
-            make_set("Dual Set A (ping -> pong)", &ping, &pong),
-            make_set("Dual Set B (pong -> ping)", &pong, &ping),
+            make_set("Activations Set A (ping -> pong)", &ping, &pong),
+            make_set("Activations Set B (pong -> ping)", &pong, &ping),
         ];
 
-        DualActivations { batch, ping, pong, sets }
+        Activations { batch, ping, pong, sets }
     }
 
-    /// Shared input checks for `forward` and `forward_dual`.
     fn check_input(&self, input: &[f32], batch: usize) -> Result<(), BoxError> {
         if batch == 0 || batch > MAX_DIMENSION {
             return Err(format!("Batch size must be 1..={MAX_DIMENSION}, got {batch}").into());
@@ -585,9 +480,9 @@ impl<'e> Mlp<'e> {
     }
 }
 
-/// Deterministic pseudo-random values in [-1, 1) (xorshift), so the demo network
-/// is the same on every run.
-fn pseudo_random(len: usize, seed: u32) -> Vec<f32> {
+/// Deterministic pseudo-random values in [-1, 1) (xorshift), so demo and test
+/// data are the same on every run.
+pub(crate) fn pseudo_random(len: usize, seed: u32) -> Vec<f32> {
     let mut state = seed.wrapping_mul(2_654_435_761).max(1);
     (0..len)
         .map(|_| {
@@ -595,6 +490,37 @@ fn pseudo_random(len: usize, seed: u32) -> Vec<f32> {
             state ^= state >> 17;
             state ^= state << 5;
             (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        })
+        .collect()
+}
+
+/// Builds a network with deterministic random weights for the demo and tests.
+/// `widths` lists the layer sizes, input first (so `widths.len() - 1` layers).
+/// `hidden` is used on every layer but the last, which uses `output`.
+///
+/// Weights are scaled by `1/sqrt(inputs)` and biases by 0.1, so activations
+/// stay around 1 through the chain instead of growing layer by layer.
+pub(crate) fn random_layers(
+    widths: &[usize],
+    seed: u32,
+    hidden: Activation,
+    output: Activation,
+) -> Vec<DenseLayer> {
+    let last = widths.len() - 2;
+    widths
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| {
+            let (inputs, outputs) = (w[0], w[1]);
+            let scale = 1.0 / (inputs as f32).sqrt();
+            let s = seed + 10 * i as u32;
+            DenseLayer {
+                weights: pseudo_random(inputs * outputs, s).iter().map(|v| v * scale).collect(),
+                bias: pseudo_random(outputs, s + 1).iter().map(|v| v * 0.1).collect(),
+                inputs,
+                outputs,
+                activation: if i == last { output } else { hidden },
+            }
         })
         .collect()
 }
@@ -613,31 +539,15 @@ fn argmax(row: &[f32]) -> usize {
 /// of the first few rows.
 pub fn run_demo() -> Result<(), BoxError> {
     use crate::matrix_multiplier::PipelineMode;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     const WIDTHS: [usize; 4] = [64, 128, 128, 10];
     const BATCH: usize = 32;
+    const CALLS: u32 = 200;
 
     // ReLU on hidden layers, softmax on the last one so each row comes out as
-    // 10 class probabilities. Weights scaled by 1/sqrt(inputs) so activations
-    // stay around 1.
-    let last = WIDTHS.len() - 2;
-    let layers: Vec<DenseLayer> = WIDTHS
-        .windows(2)
-        .enumerate()
-        .map(|(i, w)| {
-            let (inputs, outputs) = (w[0], w[1]);
-            let scale = 1.0 / (inputs as f32).sqrt();
-            let seed = 1000 + 10 * i as u32;
-            DenseLayer {
-                weights: pseudo_random(inputs * outputs, seed).iter().map(|v| v * scale).collect(),
-                bias: pseudo_random(outputs, seed + 1).iter().map(|v| v * 0.1).collect(),
-                inputs,
-                outputs,
-                activation: if i == last { Activation::Softmax } else { Activation::Relu },
-            }
-        })
-        .collect();
+    // 10 class probabilities.
+    let layers = random_layers(&WIDTHS, 1000, Activation::Relu, Activation::Softmax);
     let input = pseudo_random(BATCH * WIDTHS[0], 7);
 
     // The multiply mode doesn't matter here: the network uses the dense pipeline.
@@ -657,27 +567,20 @@ pub fn run_demo() -> Result<(), BoxError> {
     let expected = cpu_forward(&layers, &input, BATCH)?;
     let cpu_time = cpu_start.elapsed();
 
-    // The first call pays one-off driver/pipeline warm-up; the second shows the
-    // steady-state cost of an inference call.
-    let mut runs = Vec::new();
-    for _ in 0..2 {
-        let start = Instant::now();
-        let run = pollster::block_on(net.forward(&input, BATCH))?;
-        runs.push((start.elapsed(), run));
-    }
+    // The first call pays one-off warm-up and builds the ping-pong pair.
+    let first_start = Instant::now();
+    let first = pollster::block_on(net.forward(&input, BATCH))?;
+    let first_wall = first_start.elapsed();
 
-    for (_, run) in &runs {
-        if !crate::approx_eq(&run.output, &expected) {
-            return Err("MLP inference failed verification: GPU output differs from CPU".into());
-        }
+    if !crate::probs_eq(&first.output, &expected) {
+        return Err("MLP inference failed verification: GPU output differs from CPU".into());
     }
     println!("\nSUCCESS: GPU inference matches the CPU reference!");
 
     let outputs = net.output_size();
-    let output = &runs[1].1.output;
     println!("\n--- Predicted class (most probable of {outputs}, after softmax), first 8 rows ---");
     for row in 0..8 {
-        let probs = &output[row * outputs..(row + 1) * outputs];
+        let probs = &first.output[row * outputs..(row + 1) * outputs];
         let cpu_probs = &expected[row * outputs..(row + 1) * outputs];
         println!(
             "row {row}: GPU class {}  CPU class {}  (p = {:.4}, row sums to {:.6})",
@@ -688,60 +591,25 @@ pub fn run_demo() -> Result<(), BoxError> {
         );
     }
 
+    // Steady state: repeated calls reuse the cached ping-pong pair.
+    let mut device_total = Duration::ZERO;
+    let steady_start = Instant::now();
+    for _ in 0..CALLS {
+        let run = pollster::block_on(net.forward(&input, BATCH))?;
+        device_total += run.kernel_time.unwrap_or_default();
+    }
+    let steady_wall = steady_start.elapsed() / CALLS;
+
     let ms = crate::ms;
     println!("\n--- Inference Timing ({} layers in one submit) ---", net.num_layers());
-    println!("CPU forward:                    {:>10.3} ms", ms(cpu_time));
-    for (label, (wall, run)) in ["first call", "second call"].iter().zip(&runs) {
-        println!("GPU {label:<12} total (wall):   {:>10.3} ms", ms(*wall));
-        match run.kernel_time {
-            Some(t) => println!("GPU {label:<12} chain (device): {:>10.3} ms", ms(t)),
-            None => println!("GPU {label:<12} chain (device):        n/a"),
-        }
+    println!("CPU forward:                        {:>10.3} ms", ms(cpu_time));
+    println!("GPU first call, total (wall):       {:>10.3} ms", ms(first_wall));
+    println!("GPU later calls, total (wall):      {:>10.3} ms  (average of {CALLS})", ms(steady_wall));
+    if first.kernel_time.is_some() {
+        println!("GPU later calls, chain (device):    {:>10.3} ms", ms(device_total / CALLS));
+    } else {
+        println!("GPU later calls, chain (device):           n/a  (adapter lacks TIMESTAMP_QUERY)");
     }
-
-    // --- forward vs forward_dual: many back-to-back calls, same batch size ---
-    const CALLS: usize = 200;
-
-    let dual_check = pollster::block_on(net.forward_dual(&input, BATCH))?; // also warms the cache
-    if !crate::approx_eq(&dual_check.output, &expected) {
-        return Err("Dual bind group inference failed verification against the CPU".into());
-    }
-    println!("\nSUCCESS: forward_dual matches the CPU reference too!");
-
-    let time_calls = |f: &mut dyn FnMut() -> Result<GpuRun, BoxError>| -> Result<_, BoxError> {
-        let mut device_total = std::time::Duration::ZERO;
-        let start = Instant::now();
-        for _ in 0..CALLS {
-            if let Some(t) = f()?.kernel_time {
-                device_total += t;
-            }
-        }
-        Ok((start.elapsed() / CALLS as u32, device_total / CALLS as u32))
-    };
-    let (per_layer_wall, per_layer_dev) =
-        time_calls(&mut || pollster::block_on(net.forward(&input, BATCH)))?;
-    let (dual_wall, dual_dev) =
-        time_calls(&mut || pollster::block_on(net.forward_dual(&input, BATCH)))?;
-
-    println!("\n--- forward vs forward_dual, average of {CALLS} calls (batch {BATCH}) ---");
-    println!("{:<44} {:>10} {:>12}", "", "wall ms", "device ms");
-    println!(
-        "{:<44} {:>10.3} {:>12.3}",
-        "forward      (bind groups built every call)",
-        ms(per_layer_wall),
-        ms(per_layer_dev)
-    );
-    println!(
-        "{:<44} {:>10.3} {:>12.3}",
-        "forward_dual (prebuilt dual bind groups)",
-        ms(dual_wall),
-        ms(dual_dev)
-    );
-    let saved = ms(per_layer_wall) - ms(dual_wall);
-    println!(
-        "dual saves {saved:.3} ms per call ({:.1}%)",
-        100.0 * saved / ms(per_layer_wall)
-    );
 
     Ok(())
 }

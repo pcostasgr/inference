@@ -56,17 +56,16 @@ A small multi-layer perceptron. Each layer computes `Y = act(X·W + bias)`, wher
 
 ```rust
 let engine = pollster::block_on(MatrixMultiplier::new(PipelineMode::Tiled))?;
-let net = pollster::block_on(Mlp::new(&engine, &layers))?; // weights -> GPU once
-let run = pollster::block_on(net.forward(&input, batch))?; // all layers, one submit
+let mut net = pollster::block_on(Mlp::new(&engine, &layers))?; // weights -> GPU once
+let run = pollster::block_on(net.forward(&input, batch))?;     // all layers, one submit
 println!("{:?} on the GPU", run.kernel_time);
 ```
 
-#### Dual bind groups (`forward_dual`)
+#### Dual bind groups
 
-`Mlp::forward_dual` gives the same results as `forward`, but sets up the GPU
-bindings ahead of time instead of on every call. It uses separate shaders,
-`shader_dense_dual.wgsl` and `shader_softmax_dual.wgsl`, whose bindings are split
-into two groups by how often they change:
+The network shaders split their bindings into two groups ("dual descriptor
+sets"), by how often they change, so the bindings are set up ahead of time
+instead of on every call:
 
 ```
 group 0 (activations): set A = { in: ping, out: pong, batch }   built once per batch size,
@@ -75,12 +74,15 @@ group 1 (per layer):   { params, weights, bias }                built once in Ml
 ```
 
 Layer *i* binds `set A` or `set B` (alternating) as group 0, and its own group 1.
-A call with the same batch size as the last one creates no buffers or bind
-groups. It uploads the input, records the dispatches, submits once and reads
-back. Changing the batch size rebuilds the pair once. Because of that cache,
-`forward_dual` takes `&mut self`.
+A call with the same batch size as the last one builds no activation buffers or
+bind groups. It uploads the input, records the dispatches, submits once and
+reads back; only the small readback and timestamp staging buffers are still
+allocated per call. Changing the batch size rebuilds the pair once. Because of
+that cache, `forward` takes `&mut self`.
 
-The `mlp` demo times 200 back-to-back calls of each version.
+An earlier version rebuilt one bind group per layer on every call. On the
+3-layer demo network the two measured the same (within 0.2% over 200 calls):
+per-call time there is dominated by the submit and readback, not binding setup.
 
 ## Running it
 
@@ -89,8 +91,7 @@ Vulkan or DirectX 12 drivers.
 
 ```bash
 cargo run                        # 4x4 demo: multiply, add, multiply-add, with timings
-cargo run --release -- mlp       # inference demo: 64 -> 128 -> 128 -> 10 (softmax), batch 32,
-                                 # plus forward vs forward_dual timing
+cargo run --release -- mlp       # inference demo: 64 -> 128 -> 128 -> 10 (softmax), batch 32
 cargo run --release -- bench     # naive vs tiled multiply, 64..512
 cargo test                       # GPU and CPU tests
 ```
@@ -108,11 +109,12 @@ On a Radeon RX 560, release build, MLP demo (64 → 128 → 128 → 10, batch 32
 
 | | time |
 |---|---|
-| CPU forward | 0.96 ms |
-| GPU, whole call (upload + 3 layers + readback) | 2.84 ms |
-| GPU, the 3 layers on the device | 0.16 ms |
+| CPU forward | 0.89 ms |
+| GPU, first call (includes one-time setup) | 4.37 ms |
+| GPU, later calls (upload + 3 layers + softmax + readback), average of 200 | 1.51 ms |
+| GPU, the layers on the device | 0.18 ms |
 
-The GPU does the layer math in a fraction of a millisecond. The ~2.7 ms around it
+The GPU does the layer math in a fraction of a millisecond. The ~1.3 ms around it
 is the fixed cost of each call: uploading, submitting, waiting and reading back.
 At this small size, that makes the CPU faster overall. The GPU pulls ahead as the
 batch or the layers grow, because that fixed cost stays the same while the work
@@ -131,16 +133,15 @@ src/
   shader_add.wgsl       element-wise add
   shader_dense.wgsl     tiled dense layer: X·W + bias, then none, ReLU or sigmoid
   shader_softmax.wgsl   row-wise softmax in place, one workgroup per row
-  shader_dense_dual.wgsl    dense layer on the dual layout (group 0 / group 1)
-  shader_softmax_dual.wgsl  softmax on the dual layout
 ```
 
-All shaders except the `*_dual` ones share one bind-group layout: a uniform with
-the dimensions, inputs A and B, output C, and an optional fourth matrix D (the
-bias, for dense layers). The `*_dual` shaders use the two-group layout described
-under `forward_dual`.
+The multiply and add shaders share one bind-group layout: a uniform with the
+dimensions, inputs A and B, output C, and an optional fourth matrix D. The dense
+and softmax shaders use the two-group layout described under "Dual bind groups".
+
 The 16×16 workgroup size is defined once in Rust (`WORKGROUP_SIZE`) and injected
-into every shader as `BLOCK_SIZE`.
+into every shader as `BLOCK_SIZE`. It can't go above 16 with default GPU limits,
+which allow 256 threads per workgroup.
 
 ## Limits and notes
 
@@ -151,8 +152,11 @@ into every shader as `BLOCK_SIZE`.
   The benchmark stops at 512×512 for this reason.
 - **Precision:** the GPU sums dot products in a different order than the CPU,
   so results are compared with a relative tolerance, not for exact equality.
+  Sigmoid and softmax outputs use a tighter check suited to values in [0, 1].
 - **One GPU device at a time:** the GPU tests share a lock (`GPU_LOCK`), so only
   one wgpu device exists at once even though `cargo test` runs tests in parallel.
-  Opening several devices at once crashed the test machine.
+  The test machine blue-screened during some parallel runs. The crash logs
+  pointed at a Windows file-system driver, not the GPU driver, so the cause is
+  unconfirmed; the lock is a precaution.
 - **Kernel timing** needs the `TIMESTAMP_QUERY` feature. Without it,
   `kernel_time` is `None` and only wall-clock times are shown.

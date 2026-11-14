@@ -12,7 +12,12 @@ pub const MAX_DIMENSION: usize = 4096;
 
 /// Workgroup edge length (threads per axis). Injected into the WGSL
 /// shaders as `BLOCK_SIZE`, so this is the single source of truth.
+///
+/// Cannot exceed 16 with default GPU limits: the shaders use
+/// `BLOCK_SIZE * BLOCK_SIZE` threads per workgroup, and the default
+/// `max_compute_invocations_per_workgroup` is 256.
 pub const WORKGROUP_SIZE: u32 = 16;
+const _: () = assert!(WORKGROUP_SIZE * WORKGROUP_SIZE <= 256);
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -34,7 +39,8 @@ pub enum PipelineMode {
 
 type BoxError = Box<dyn std::error::Error>;
 
-/// Result of a GPU multiply, with the kernel's on-GPU execution time when available.
+/// Result of one GPU operation (multiply, add, multiply-add or a network
+/// forward pass), with its on-GPU execution time when available.
 pub struct GpuRun {
     pub output: Vec<f32>,
     /// Time the compute pass took on the GPU, measured with timestamp queries.
@@ -42,26 +48,24 @@ pub struct GpuRun {
     pub kernel_time: Option<Duration>,
 }
 
-/// Reusable GPU engine that holds the GPU device, queue, the chosen multiply
-/// pipeline, an element-wise addition pipeline and a dense (NN layer) pipeline.
+/// Reusable GPU engine: the device and queue, the chosen multiply pipeline, the
+/// element-wise add pipeline, and the dense-layer and softmax pipelines that
+/// [`crate::mlp`] uses.
 pub struct MatrixMultiplier {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     add_pipeline: wgpu::ComputePipeline,
-    /// Tiled `Y = act(X * W + bias)`; used by [`crate::mlp`].
+    /// Layout for multiply / add: uniform, A, B, C (out), D.
+    bind_group_layout: wgpu::BindGroupLayout,
+    /// Network layout, group 0: the ping-pong activation pair (in, out, batch size).
+    pub(crate) act_layout: wgpu::BindGroupLayout,
+    /// Network layout, group 1: one layer's constants (params, weights, bias).
+    pub(crate) layer_layout: wgpu::BindGroupLayout,
+    /// Tiled `Y = act(X * W + bias)` (`shader_dense.wgsl`).
     pub(crate) dense_pipeline: wgpu::ComputePipeline,
-    /// In-place row-wise softmax, run after a dense layer; used by [`crate::mlp`].
+    /// In-place row-wise softmax, run after a dense layer (`shader_softmax.wgsl`).
     pub(crate) softmax_pipeline: wgpu::ComputePipeline,
-    /// Shared 5-binding layout: uniform, A, B, C (out), D.
-    pub(crate) bind_group_layout: wgpu::BindGroupLayout,
-    /// Dual layout, group 0: the ping-pong activation pair (in, out, batch size).
-    pub(crate) dual_act_layout: wgpu::BindGroupLayout,
-    /// Dual layout, group 1: one layer's constants (params, weights, bias).
-    pub(crate) dual_layer_layout: wgpu::BindGroupLayout,
-    /// `shader_dense_dual.wgsl` / `shader_softmax_dual.wgsl`, on the dual layout.
-    pub(crate) dense_dual_pipeline: wgpu::ComputePipeline,
-    pub(crate) softmax_dual_pipeline: wgpu::ComputePipeline,
     adapter_info: wgpu::AdapterInfo,
     /// Two-entry timestamp query set (pass begin/end), if supported.
     query_set: Option<wgpu::QuerySet>,
@@ -110,7 +114,8 @@ pub(crate) async fn pop_error_scopes(device: &wgpu::Device) -> Result<(), BoxErr
 }
 
 impl MatrixMultiplier {
-    /// Initializes GPU context and compiles only the selected pipeline mode.
+    /// Initializes the GPU context and compiles the pipelines: the multiply
+    /// kernel selected by `mode`, plus add, dense layer and softmax.
     pub async fn new(mode: PipelineMode) -> Result<Self, BoxError> {
         let instance = wgpu::Instance::default();
 
@@ -159,16 +164,7 @@ impl MatrixMultiplier {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Compute Bind Group Layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                uniform_entry(0),
                 storage_entry(1, true),
                 storage_entry(2, true),
                 storage_entry(3, false),
@@ -189,53 +185,41 @@ impl MatrixMultiplier {
             "Matrix Add",
             include_str!("shader_add.wgsl"),
         );
-        let dense_pipeline = create_pipeline(
-            &device,
-            &pipeline_layout,
-            "Dense Layer",
-            include_str!("shader_dense.wgsl"),
-        );
-        let softmax_pipeline = create_pipeline(
-            &device,
-            &pipeline_layout,
-            "Row Softmax",
-            include_str!("shader_softmax.wgsl"),
-        );
 
         // Dual bind group layout for the MLP: activations in group 0 (two
         // prebuilt sets that alternate), per-layer constants in group 1.
-        let dual_act_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Dual: Activations (group 0)"),
+        let act_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Network: Activations (group 0)"),
             entries: &[
                 storage_entry(0, true),  // X: this layer's input (ping or pong)
                 storage_entry(1, false), // Y: this layer's output (the other one)
                 uniform_entry(2),        // batch size
             ],
         });
-        let dual_layer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Dual: Layer (group 1)"),
+        let layer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Network: Layer (group 1)"),
             entries: &[
                 uniform_entry(0),       // K, N, activation
                 storage_entry(1, true), // weights
                 storage_entry(2, true), // bias
             ],
         });
-        let dual_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Dual Pipeline Layout"),
-            bind_group_layouts: &[&dual_act_layout, &dual_layer_layout],
+        let network_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Network Pipeline Layout"),
+            bind_group_layouts: &[&act_layout, &layer_layout],
             push_constant_ranges: &[],
         });
-        let dense_dual_pipeline = create_pipeline(
+        let dense_pipeline = create_pipeline(
             &device,
-            &dual_pipeline_layout,
-            "Dense Layer (dual)",
-            include_str!("shader_dense_dual.wgsl"),
+            &network_layout,
+            "Dense Layer",
+            include_str!("shader_dense.wgsl"),
         );
-        let softmax_dual_pipeline = create_pipeline(
+        let softmax_pipeline = create_pipeline(
             &device,
-            &dual_pipeline_layout,
-            "Row Softmax (dual)",
-            include_str!("shader_softmax_dual.wgsl"),
+            &network_layout,
+            "Row Softmax",
+            include_str!("shader_softmax.wgsl"),
         );
 
         pop_error_scopes(&device).await?;
@@ -245,13 +229,11 @@ impl MatrixMultiplier {
             queue,
             pipeline,
             add_pipeline,
+            bind_group_layout,
+            act_layout,
+            layer_layout,
             dense_pipeline,
             softmax_pipeline,
-            bind_group_layout,
-            dual_act_layout,
-            dual_layer_layout,
-            dense_dual_pipeline,
-            softmax_dual_pipeline,
             adapter_info,
             query_set,
         })
@@ -262,7 +244,7 @@ impl MatrixMultiplier {
         &self.adapter_info
     }
 
-    /// Whether `multiply_timed` can report on-GPU kernel time.
+    /// Whether operations can report on-GPU time (`GpuRun::kernel_time`).
     pub fn has_kernel_timer(&self) -> bool {
         self.query_set.is_some()
     }
@@ -626,7 +608,7 @@ fn create_pipeline(
     })
 }
 
-type MapReceiver =std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>;
+type MapReceiver = std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>;
 
 /// Starts mapping the whole buffer for reading; completes on the next `device.poll`.
 fn map_read(buffer: &wgpu::Buffer) -> MapReceiver {

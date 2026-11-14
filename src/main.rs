@@ -135,6 +135,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => println!("GPU kernel (on-device):        n/a  (adapter lacks TIMESTAMP_QUERY)"),
     }
 
+
+    // --- Fused multiply-add: C = A * B + D, in one kernel ---
+    let matrix_d: Vec<f32> = (0..m * n).map(|i| i as f32).collect();
+
+    let cpu_madd_start = Instant::now();
+    let cpu_madd = cpu_matrix_add(&cpu_matrix_multiply(&matrix_a, &matrix_b, m, k, n), &matrix_d);
+    let cpu_madd_time = cpu_madd_start.elapsed();
+
+    let gpu_madd_start = Instant::now();
+    let madd_run =
+        pollster::block_on(engine.multiply_add_timed(&matrix_a, &matrix_b, &matrix_d, m, k, n))?;
+    let gpu_madd_wall = gpu_madd_start.elapsed();
+
+    println!("\n--- Matrix D ({m}x{n}) ---");
+    print_matrix(&matrix_d, m, n);
+
+    println!("\n--- GPU Result A * B + D (fused) ---");
+    print_matrix(&madd_run.output, m, n);
+
+    if !approx_eq(&madd_run.output, &cpu_madd) {
+        return Err("Multiply-add failed verification: GPU result differs from CPU".into());
+    }
+    println!("\nSUCCESS: GPU multiply-add matches CPU calculation!");
+
+    println!("\n--- Multiply-Add Timing ---");
+    println!("CPU multiply-add:       {:>10.3} ms", ms(cpu_madd_time));
+    println!("GPU total (wall):       {:>10.3} ms  (upload + dispatch + readback)", ms(gpu_madd_wall));
+    match madd_run.kernel_time {
+        Some(t) => println!("GPU kernel (on-device): {:>10.3} ms", ms(t)),
+        None => println!("GPU kernel (on-device):        n/a  (adapter lacks TIMESTAMP_QUERY)"),
+    }
+
     println!("\nRun `cargo run --release -- bench` to time larger matrices.");
 
     Ok(())
@@ -203,6 +235,40 @@ mod tests {
     #[test]
     fn tiled_matches_cpu() {
         check_mode(PipelineMode::Tiled);
+    }
+
+    fn check_madd(mode: PipelineMode) {
+        with_engine(mode, |engine| {
+            for (i, &(m, k, n)) in SHAPES.iter().enumerate() {
+                let a = test_matrix(m * k, 200 + 3 * i as u32);
+                let b = test_matrix(k * n, 201 + 3 * i as u32);
+                let d = test_matrix(m * n, 202 + 3 * i as u32);
+                let expected = cpu_matrix_add(&cpu_matrix_multiply(&a, &b, m, k, n), &d);
+                let got = pollster::block_on(engine.multiply_add(&a, &b, &d, m, k, n))
+                    .unwrap_or_else(|e| panic!("{mode:?} madd {m}x{k}x{n}: {e}"));
+                assert!(approx_eq(&got, &expected), "{mode:?} madd mismatch for {m}x{k}x{n}");
+            }
+        });
+    }
+
+    #[test]
+    fn naive_madd_matches_cpu() {
+        check_madd(PipelineMode::Naive);
+    }
+
+    #[test]
+    fn tiled_madd_matches_cpu() {
+        check_madd(PipelineMode::Tiled);
+    }
+
+    #[test]
+    fn madd_rejects_wrong_d_len() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            let a = [1.0f32; 6]; // 2x3
+            let b = [1.0f32; 12]; // 3x4
+            let d_bad = [0.0f32; 7]; // should be 2x4 = 8
+            assert!(pollster::block_on(engine.multiply_add(&a, &b, &d_bad, 2, 3, 4)).is_err());
+        });
     }
 
     /// Addition shapes: single element, exact tile, partial tiles, thin rows/columns.

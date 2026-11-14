@@ -20,7 +20,8 @@ struct Dimensions {
     m: u32,
     k: u32,
     n: u32,
-    _pad: u32,
+    /// 1 when the multiply shaders should add D (multiply-add); also keeps 16-byte size.
+    has_d: u32,
 }
 
 /// Pipeline mode selected by the caller
@@ -146,6 +147,7 @@ impl MatrixMultiplier {
                 storage_entry(1, true),
                 storage_entry(2, true),
                 storage_entry(3, false),
+                storage_entry(4, true), // D for multiply-add; a 1-element placeholder otherwise
             ],
         });
 
@@ -209,6 +211,50 @@ impl MatrixMultiplier {
         k: usize,
         n: usize,
     ) -> Result<GpuRun, BoxError> {
+        self.matmul(matrix_a, matrix_b, None, m, k, n).await
+    }
+
+    /// Fused multiply-add: C = A (m x k) * B (k x n) + D (m x n), in a single kernel.
+    /// Cheaper than `multiply` then `add`, which round-trips A*B through the CPU.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn multiply_add(
+        &self,
+        matrix_a: &[f32],
+        matrix_b: &[f32],
+        matrix_d: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, BoxError> {
+        Ok(self
+            .multiply_add_timed(matrix_a, matrix_b, matrix_d, m, k, n)
+            .await?
+            .output)
+    }
+
+    /// Like [`multiply_add`](Self::multiply_add), but also returns the GPU kernel time.
+    pub async fn multiply_add_timed(
+        &self,
+        matrix_a: &[f32],
+        matrix_b: &[f32],
+        matrix_d: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<GpuRun, BoxError> {
+        self.matmul(matrix_a, matrix_b, Some(matrix_d), m, k, n).await
+    }
+
+    /// Shared validation + dispatch for multiply (`d = None`) and multiply-add.
+    async fn matmul(
+        &self,
+        matrix_a: &[f32],
+        matrix_b: &[f32],
+        matrix_d: Option<&[f32]>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<GpuRun, BoxError> {
         if m == 0 || k == 0 || n == 0 {
             return Err("Matrix dimensions must be non-zero".into());
         }
@@ -238,15 +284,27 @@ impl MatrixMultiplier {
             .into());
         }
 
+        if let Some(d) = matrix_d
+            && d.len() != m * n
+        {
+            return Err(format!(
+                "Matrix D slice length ({}) does not match m * n ({m} * {n} = {})",
+                d.len(),
+                m * n
+            )
+            .into());
+        }
+
         // Dimensions are bounded by MAX_DIMENSION, so these casts cannot truncate.
         let dims = Dimensions {
             m: m as u32,
             k: k as u32,
             n: n as u32,
-            _pad: 0,
+            has_d: matrix_d.is_some() as u32,
         };
 
-        self.dispatch(&self.pipeline, dims, matrix_a, matrix_b).await
+        self.dispatch(&self.pipeline, dims, matrix_a, matrix_b, matrix_d)
+            .await
     }
 
     /// Adds two `rows x cols` matrices element-wise on the GPU: C = A + B.
@@ -295,20 +353,22 @@ impl MatrixMultiplier {
             m: rows as u32,
             k: 0,
             n: cols as u32,
-            _pad: 0,
+            has_d: 0,
         };
 
-        self.dispatch(&self.add_pipeline, dims, matrix_a, matrix_b).await
+        self.dispatch(&self.add_pipeline, dims, matrix_a, matrix_b, None)
+            .await
     }
 
-    /// Uploads A and B, runs `pipeline` over an `m x n` output grid, and reads C back.
-    /// Inputs must already be validated against `dims`.
+    /// Uploads A, B (and D if given), runs `pipeline` over an `m x n` output grid,
+    /// and reads C back. Inputs must already be validated against `dims`.
     async fn dispatch(
         &self,
         pipeline: &wgpu::ComputePipeline,
         dims: Dimensions,
         matrix_a: &[f32],
         matrix_b: &[f32],
+        matrix_d: Option<&[f32]>,
     ) -> Result<GpuRun, BoxError> {
         let (m, n) = (dims.m as usize, dims.n as usize);
 
@@ -329,6 +389,14 @@ impl MatrixMultiplier {
         let b_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Matrix B Storage Buffer"),
             contents: bytemuck::cast_slice(matrix_b),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        // Binding 4 must always be bound; without D, a 1-element placeholder the
+        // shaders never read (they check `has_d`).
+        let d_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Matrix D Storage Buffer"),
+            contents: bytemuck::cast_slice(matrix_d.unwrap_or(&[0.0])),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
@@ -355,6 +423,7 @@ impl MatrixMultiplier {
                 wgpu::BindGroupEntry { binding: 1, resource: a_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: b_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: c_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: d_buffer.as_entire_binding() },
             ],
         });
 

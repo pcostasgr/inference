@@ -1,5 +1,6 @@
 mod bench;
 mod matrix_multiplier;
+mod mlp;
 use matrix_multiplier::{MatrixMultiplier, PipelineMode, MAX_DIMENSION};
 use std::time::{Duration, Instant};
 
@@ -45,8 +46,10 @@ fn print_matrix(mat: &[f32], rows: usize, cols: usize) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().nth(1).as_deref() == Some("bench") {
-        return bench::run();
+    match std::env::args().nth(1).as_deref() {
+        Some("bench") => return bench::run(),
+        Some("mlp") => return mlp::run_demo(),
+        _ => {}
     }
 
     println!("Matrix Size Limit: Max dimension = {MAX_DIMENSION}");
@@ -268,6 +271,169 @@ mod tests {
             let b = [1.0f32; 12]; // 3x4
             let d_bad = [0.0f32; 7]; // should be 2x4 = 8
             assert!(pollster::block_on(engine.multiply_add(&a, &b, &d_bad, 2, 3, 4)).is_err());
+        });
+    }
+
+    fn dense(inputs: usize, outputs: usize, seed: u32) -> mlp::DenseLayer {
+        mlp::DenseLayer {
+            weights: test_matrix(inputs * outputs, seed),
+            bias: test_matrix(outputs, seed + 1),
+            inputs,
+            outputs,
+            activation: mlp::Activation::Relu,
+        }
+    }
+
+    #[test]
+    fn mlp_uploads_weights_once() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            let layers = [dense(64, 128, 1), dense(128, 33, 3), dense(33, 10, 5)];
+            let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).expect("upload failed");
+
+            assert_eq!(net.num_layers(), 3);
+            assert_eq!(net.input_size(), 64);
+            assert_eq!(net.output_size(), 10);
+            assert_eq!(net.max_width(), 128);
+
+            let floats: usize = layers.iter().map(|l| l.weights.len() + l.bias.len()).sum();
+            assert_eq!(net.gpu_param_bytes(), (floats * 4) as u64);
+        });
+    }
+
+    #[test]
+    fn mlp_rejects_invalid_layers() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            let mismatched = [dense(8, 16, 1), dense(15, 4, 3)];
+            assert!(pollster::block_on(mlp::Mlp::new(engine, &mismatched)).is_err());
+        });
+    }
+
+    fn identity_layer(width: usize) -> mlp::DenseLayer {
+        let mut weights = vec![0.0; width * width];
+        for i in 0..width {
+            weights[i * width + i] = 1.0;
+        }
+        mlp::DenseLayer {
+            weights,
+            bias: vec![0.0; width],
+            inputs: width,
+            outputs: width,
+            activation: mlp::Activation::None,
+        }
+    }
+
+    /// Identity layers must pass the input through unchanged, whether the
+    /// ping-pong ends in pong (odd layer count) or ping (even).
+    #[test]
+    fn mlp_forward_identity_chain_any_length() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            let (width, batch) = (5, 3);
+            let input = test_matrix(batch * width, 42);
+            for n_layers in 1..=4 {
+                let layers = vec![identity_layer(width); n_layers];
+                let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
+                let out = pollster::block_on(net.forward(&input, batch)).unwrap().output;
+                assert_eq!(out, input, "identity chain of {n_layers} layers changed the input");
+            }
+        });
+    }
+
+    /// Small 2 -> 2 (ReLU) -> 3 network worked out by hand, batch of 2.
+    #[test]
+    fn mlp_forward_hand_computed() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            #[rustfmt::skip]
+            let layers = [
+                mlp::DenseLayer {
+                    weights: vec![1.0, -1.0,
+                                  2.0,  1.0],
+                    bias: vec![-6.0, 0.5],
+                    inputs: 2, outputs: 2,
+                    activation: mlp::Activation::Relu,
+                },
+                mlp::DenseLayer {
+                    weights: vec![1.0, 0.0, 2.0,
+                                  1.0, 1.0, 0.0],
+                    bias: vec![0.0, 0.0, 0.0],
+                    inputs: 2, outputs: 3,
+                    activation: mlp::Activation::None,
+                },
+            ];
+            let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
+
+            // Row 0: [1,2]·W1 = [5,1]; +bias = [-1,1.5]; ReLU = [0,1.5]; ·W2 = [1.5,1.5,0]
+            // Row 1: [0,0]·W1 = [0,0]; +bias = [-6,0.5]; ReLU = [0,0.5]; ·W2 = [0.5,0.5,0]
+            let input = [1.0, 2.0, 0.0, 0.0];
+            let run = pollster::block_on(net.forward(&input, 2)).unwrap();
+            assert_eq!(run.output, vec![1.5, 1.5, 0.0, 0.5, 0.5, 0.0]);
+
+            // Weights stay on the GPU: a second call gives the same answer.
+            let again = pollster::block_on(net.forward(&input, 2)).unwrap();
+            assert_eq!(again.output, run.output);
+        });
+    }
+
+    /// Random network with the given widths: ReLU on hidden layers, none on the
+    /// output. Weights are scaled by 1/sqrt(inputs) so activations stay around 1
+    /// through the chain instead of growing layer by layer.
+    fn random_net(widths: &[usize], seed: u32) -> Vec<mlp::DenseLayer> {
+        let last = widths.len() - 2;
+        widths
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                let (inputs, outputs) = (w[0], w[1]);
+                let scale = 1.0 / (inputs as f32).sqrt();
+                let s = seed + 10 * i as u32;
+                mlp::DenseLayer {
+                    weights: test_matrix(inputs * outputs, s).iter().map(|v| v * scale).collect(),
+                    bias: test_matrix(outputs, s + 1),
+                    inputs,
+                    outputs,
+                    activation: if i == last { mlp::Activation::None } else { mlp::Activation::Relu },
+                }
+            })
+            .collect()
+    }
+
+    /// (batch, layer widths): widths and batches off the 16-wide tile grid, chains
+    /// of 1–4 layers (both ping-pong endings), widening and narrowing layers.
+    const MLP_SHAPES: &[(usize, &[usize])] = &[
+        (1, &[3, 1]),
+        (16, &[16, 16]),
+        (33, &[64, 128, 10]),
+        (17, &[100, 33, 47, 5]),
+        (5, &[7, 130, 1, 20, 9]),
+    ];
+
+    #[test]
+    fn mlp_forward_matches_cpu() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            for (i, &(batch, widths)) in MLP_SHAPES.iter().enumerate() {
+                let layers = random_net(widths, 300 + 50 * i as u32);
+                let input = test_matrix(batch * widths[0], 900 + i as u32);
+
+                let expected = mlp::cpu_forward(&layers, &input, batch).unwrap();
+                let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
+                let got = pollster::block_on(net.forward(&input, batch))
+                    .unwrap_or_else(|e| panic!("forward {widths:?} batch {batch}: {e}"))
+                    .output;
+
+                assert!(
+                    approx_eq(&got, &expected),
+                    "GPU/CPU mismatch for widths {widths:?}, batch {batch}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn mlp_forward_rejects_bad_input() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            let net = pollster::block_on(mlp::Mlp::new(engine, &[dense(4, 2, 1)])).unwrap();
+            assert!(pollster::block_on(net.forward(&[1.0; 4], 0)).is_err());
+            assert!(pollster::block_on(net.forward(&[1.0; 7], 2)).is_err());
+            assert!(pollster::block_on(net.forward(&[1.0; 4], MAX_DIMENSION + 1)).is_err());
         });
     }
 

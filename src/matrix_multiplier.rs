@@ -43,13 +43,16 @@ pub struct GpuRun {
 }
 
 /// Reusable GPU engine that holds the GPU device, queue, the chosen multiply
-/// pipeline and an element-wise addition pipeline.
+/// pipeline, an element-wise addition pipeline and a dense (NN layer) pipeline.
 pub struct MatrixMultiplier {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     add_pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    /// Tiled `Y = act(X * W + bias)`; used by [`crate::mlp`].
+    pub(crate) dense_pipeline: wgpu::ComputePipeline,
+    /// Shared 5-binding layout: uniform, A, B, C (out), D.
+    pub(crate) bind_group_layout: wgpu::BindGroupLayout,
     adapter_info: wgpu::AdapterInfo,
     /// Two-entry timestamp query set (pass begin/end), if supported.
     query_set: Option<wgpu::QuerySet>,
@@ -69,13 +72,13 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 }
 
 /// Pushes validation + out-of-memory error scopes; pair with [`pop_error_scopes`].
-fn push_error_scopes(device: &wgpu::Device) {
+pub(crate) fn push_error_scopes(device: &wgpu::Device) {
     device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     device.push_error_scope(wgpu::ErrorFilter::Validation);
 }
 
 /// Pops the scopes pushed by [`push_error_scopes`], returning the first error captured.
-async fn pop_error_scopes(device: &wgpu::Device) -> Result<(), BoxError> {
+pub(crate) async fn pop_error_scopes(device: &wgpu::Device) -> Result<(), BoxError> {
     let validation = device.pop_error_scope().await;
     let oom = device.pop_error_scope().await;
     match validation.or(oom) {
@@ -164,6 +167,12 @@ impl MatrixMultiplier {
             "Matrix Add",
             include_str!("shader_add.wgsl"),
         );
+        let dense_pipeline = create_pipeline(
+            &device,
+            &pipeline_layout,
+            "Dense Layer",
+            include_str!("shader_dense.wgsl"),
+        );
 
         pop_error_scopes(&device).await?;
 
@@ -172,6 +181,7 @@ impl MatrixMultiplier {
             queue,
             pipeline,
             add_pipeline,
+            dense_pipeline,
             bind_group_layout,
             adapter_info,
             query_set,
@@ -408,13 +418,6 @@ impl MatrixMultiplier {
             mapped_at_creation: false,
         });
 
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer for Readback"),
-            size: c_buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Compute Bind Group"),
             layout: &self.bind_group_layout,
@@ -425,6 +428,43 @@ impl MatrixMultiplier {
                 wgpu::BindGroupEntry { binding: 3, resource: c_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: d_buffer.as_entire_binding() },
             ],
+        });
+
+        self.run_pass(
+            |pass| {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(
+                    dims.n.div_ceil(WORKGROUP_SIZE),
+                    dims.m.div_ceil(WORKGROUP_SIZE),
+                    1,
+                );
+            },
+            &c_buffer,
+            m * n,
+        )
+        .await
+    }
+
+    /// Records one timed compute pass (via `record`), submits it, and reads back the
+    /// first `out_len` floats of `output`.
+    ///
+    /// The caller must have called [`push_error_scopes`] before creating the
+    /// resources used here; this pops them so GPU errors surface as `Err`.
+    /// Dispatches recorded in the same pass that write then read a buffer are
+    /// synchronized by wgpu automatically.
+    pub(crate) async fn run_pass(
+        &self,
+        record: impl FnOnce(&mut wgpu::ComputePass<'_>),
+        output: &wgpu::Buffer,
+        out_len: usize,
+    ) -> Result<GpuRun, BoxError> {
+        let out_bytes = (out_len * size_of::<f32>()) as u64;
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer for Readback"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -444,16 +484,10 @@ impl MatrixMultiplier {
                 label: Some("Matrix Compute Pass"),
                 timestamp_writes,
             });
-
-            compute_pass.set_pipeline(pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
-
-            let workgroups_x = dims.n.div_ceil(WORKGROUP_SIZE);
-            let workgroups_y = dims.m.div_ceil(WORKGROUP_SIZE);
-            compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            record(&mut compute_pass);
         }
 
-        encoder.copy_buffer_to_buffer(&c_buffer, 0, &staging_buffer, 0, c_buffer_size);
+        encoder.copy_buffer_to_buffer(output, 0, &staging_buffer, 0, out_bytes);
 
         // Resolve the two u64 timestamps and copy them somewhere mappable.
         const TS_BYTES: u64 = 2 * size_of::<u64>() as u64;

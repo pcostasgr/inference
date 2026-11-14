@@ -55,9 +55,29 @@ pub struct MatrixMultiplier {
     pub(crate) softmax_pipeline: wgpu::ComputePipeline,
     /// Shared 5-binding layout: uniform, A, B, C (out), D.
     pub(crate) bind_group_layout: wgpu::BindGroupLayout,
+    /// Dual layout, group 0: the ping-pong activation pair (in, out, batch size).
+    pub(crate) dual_act_layout: wgpu::BindGroupLayout,
+    /// Dual layout, group 1: one layer's constants (params, weights, bias).
+    pub(crate) dual_layer_layout: wgpu::BindGroupLayout,
+    /// `shader_dense_dual.wgsl` / `shader_softmax_dual.wgsl`, on the dual layout.
+    pub(crate) dense_dual_pipeline: wgpu::ComputePipeline,
+    pub(crate) softmax_dual_pipeline: wgpu::ComputePipeline,
     adapter_info: wgpu::AdapterInfo,
     /// Two-entry timestamp query set (pass begin/end), if supported.
     query_set: Option<wgpu::QuerySet>,
+}
+
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -182,6 +202,42 @@ impl MatrixMultiplier {
             include_str!("shader_softmax.wgsl"),
         );
 
+        // Dual bind group layout for the MLP: activations in group 0 (two
+        // prebuilt sets that alternate), per-layer constants in group 1.
+        let dual_act_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Dual: Activations (group 0)"),
+            entries: &[
+                storage_entry(0, true),  // X: this layer's input (ping or pong)
+                storage_entry(1, false), // Y: this layer's output (the other one)
+                uniform_entry(2),        // batch size
+            ],
+        });
+        let dual_layer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Dual: Layer (group 1)"),
+            entries: &[
+                uniform_entry(0),       // K, N, activation
+                storage_entry(1, true), // weights
+                storage_entry(2, true), // bias
+            ],
+        });
+        let dual_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Dual Pipeline Layout"),
+            bind_group_layouts: &[&dual_act_layout, &dual_layer_layout],
+            push_constant_ranges: &[],
+        });
+        let dense_dual_pipeline = create_pipeline(
+            &device,
+            &dual_pipeline_layout,
+            "Dense Layer (dual)",
+            include_str!("shader_dense_dual.wgsl"),
+        );
+        let softmax_dual_pipeline = create_pipeline(
+            &device,
+            &dual_pipeline_layout,
+            "Row Softmax (dual)",
+            include_str!("shader_softmax_dual.wgsl"),
+        );
+
         pop_error_scopes(&device).await?;
 
         Ok(Self {
@@ -192,6 +248,10 @@ impl MatrixMultiplier {
             dense_pipeline,
             softmax_pipeline,
             bind_group_layout,
+            dual_act_layout,
+            dual_layer_layout,
+            dense_dual_pipeline,
+            softmax_dual_pipeline,
             adapter_info,
             query_set,
         })

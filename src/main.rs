@@ -500,6 +500,63 @@ mod tests {
         });
     }
 
+    /// The dual bind group path must give the same answers as `forward` and the
+    /// CPU on every shape and activation mix (incl. a softmax output).
+    #[test]
+    fn mlp_forward_dual_matches_forward_and_cpu() {
+        use mlp::Activation::{None as Raw, Relu, Sigmoid, Softmax};
+        with_engine(PipelineMode::Tiled, |engine| {
+            for (hidden, output) in [(Relu, Raw), (Sigmoid, Raw), (Relu, Softmax)] {
+                for (i, &(batch, widths)) in MLP_SHAPES.iter().enumerate() {
+                    let layers = random_net(widths, 300 + 50 * i as u32, hidden, output);
+                    let input = test_matrix(batch * widths[0], 900 + i as u32);
+                    let what = format!("{hidden:?}/{output:?} {widths:?} batch {batch}");
+
+                    let mut net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
+                    let single = pollster::block_on(net.forward(&input, batch)).unwrap().output;
+                    let dual = pollster::block_on(net.forward_dual(&input, batch))
+                        .unwrap_or_else(|e| panic!("forward_dual {what}: {e}"))
+                        .output;
+                    let cpu = mlp::cpu_forward(&layers, &input, batch).unwrap();
+
+                    assert!(approx_eq(&dual, &cpu), "dual vs CPU mismatch for {what}");
+                    assert!(approx_eq(&dual, &single), "dual vs forward mismatch for {what}");
+                }
+            }
+        });
+    }
+
+    /// The ping-pong pair is built once per batch size and reused; changing the
+    /// batch rebuilds it, and results stay correct throughout.
+    #[test]
+    fn mlp_forward_dual_caches_per_batch() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            let layers = random_net(&[20, 40, 7], 77, mlp::Activation::Relu, mlp::Activation::None);
+            let mut net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
+            assert_eq!(net.dual_cached_batch(), None, "nothing cached before the first call");
+
+            let check = |net: &mut mlp::Mlp, batch: usize, seed: u32| {
+                let input = test_matrix(batch * 20, seed);
+                let got = pollster::block_on(net.forward_dual(&input, batch)).unwrap().output;
+                let cpu = mlp::cpu_forward(&layers, &input, batch).unwrap();
+                assert!(approx_eq(&got, &cpu), "batch {batch}: mismatch");
+                assert_eq!(net.dual_cached_batch(), Some(batch));
+            };
+
+            check(&mut net, 3, 1);
+            check(&mut net, 3, 2); // same batch: cache reused, new input
+            check(&mut net, 3, 3);
+            check(&mut net, 17, 4); // new batch: rebuilt (and wider than one tile)
+            check(&mut net, 1, 5);
+            check(&mut net, 3, 6); // back to 3: rebuilt again, still correct
+
+            // Bad input is rejected before touching the cache.
+            assert!(pollster::block_on(net.forward_dual(&[1.0; 7], 3)).is_err());
+            assert!(pollster::block_on(net.forward_dual(&[1.0; 20], 0)).is_err());
+            assert_eq!(net.dual_cached_batch(), Some(3));
+        });
+    }
+
     #[test]
     fn mlp_forward_rejects_bad_input() {
         with_engine(PipelineMode::Tiled, |engine| {

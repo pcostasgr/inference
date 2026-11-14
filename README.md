@@ -61,6 +61,27 @@ let run = pollster::block_on(net.forward(&input, batch))?; // all layers, one su
 println!("{:?} on the GPU", run.kernel_time);
 ```
 
+#### Dual bind groups (`forward_dual`)
+
+`Mlp::forward_dual` gives the same results as `forward`, but sets up the GPU
+bindings ahead of time instead of on every call. It uses separate shaders,
+`shader_dense_dual.wgsl` and `shader_softmax_dual.wgsl`, whose bindings are split
+into two groups by how often they change:
+
+```
+group 0 (activations): set A = { in: ping, out: pong, batch }   built once per batch size,
+                       set B = { in: pong, out: ping, batch }   cached in the Mlp
+group 1 (per layer):   { params, weights, bias }                built once in Mlp::new
+```
+
+Layer *i* binds `set A` or `set B` (alternating) as group 0, and its own group 1.
+A call with the same batch size as the last one creates no buffers or bind
+groups. It uploads the input, records the dispatches, submits once and reads
+back. Changing the batch size rebuilds the pair once. Because of that cache,
+`forward_dual` takes `&mut self`.
+
+The `mlp` demo times 200 back-to-back calls of each version.
+
 ## Running it
 
 Requires a recent stable Rust toolchain (edition 2024) and a GPU with
@@ -68,7 +89,8 @@ Vulkan or DirectX 12 drivers.
 
 ```bash
 cargo run                        # 4x4 demo: multiply, add, multiply-add, with timings
-cargo run --release -- mlp       # inference demo: 64 -> 128 -> 128 -> 10 (softmax), batch 32
+cargo run --release -- mlp       # inference demo: 64 -> 128 -> 128 -> 10 (softmax), batch 32,
+                                 # plus forward vs forward_dual timing
 cargo run --release -- bench     # naive vs tiled multiply, 64..512
 cargo test                       # GPU and CPU tests
 ```
@@ -109,10 +131,14 @@ src/
   shader_add.wgsl       element-wise add
   shader_dense.wgsl     tiled dense layer: X·W + bias, then none, ReLU or sigmoid
   shader_softmax.wgsl   row-wise softmax in place, one workgroup per row
+  shader_dense_dual.wgsl    dense layer on the dual layout (group 0 / group 1)
+  shader_softmax_dual.wgsl  softmax on the dual layout
 ```
 
-All shaders share one bind-group layout: a uniform with the dimensions, inputs A
-and B, output C, and an optional fourth matrix D (the bias, for dense layers).
+All shaders except the `*_dual` ones share one bind-group layout: a uniform with
+the dimensions, inputs A and B, output C, and an optional fourth matrix D (the
+bias, for dense layers). The `*_dual` shaders use the two-group layout described
+under `forward_dual`.
 The 16×16 workgroup size is defined once in Rust (`WORKGROUP_SIZE`) and injected
 into every shader as `BLOCK_SIZE`.
 

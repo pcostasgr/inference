@@ -15,7 +15,7 @@ operation can report how long it took, both overall and on the GPU itself.
 | Matrix multiply, `C = A·B` | `multiply`, `multiply_timed` | `shader.wgsl` (naive) or `shader_tiled.wgsl` (tiled) |
 | Element-wise add, `C = A + B` | `add`, `add_timed` | `shader_add.wgsl` |
 | Fused multiply-add, `C = A·B + D` | `multiply_add`, `multiply_add_timed` | the multiply shader, with D added in its final write |
-| MLP inference, `Y = act(X·W + b)` per layer | `Mlp::new`, `Mlp::forward` | `shader_dense.wgsl` |
+| MLP inference, `Y = act(X·W + b)` per layer | `Mlp::new`, `Mlp::forward` | `shader_dense.wgsl` (+ `shader_softmax.wgsl`) |
 
 ### Matrix engine (`src/matrix_multiplier.rs`)
 
@@ -40,6 +40,11 @@ A small multi-layer perceptron. Each layer computes `Y = act(X·W + bias)`, wher
 - `Sigmoid`: `1 / (1 + e^-v)`, squashing values into (0, 1). The input is clamped to
   ±30 first (on both GPU and CPU). Beyond that the result is already 0 or 1 in f32,
   and the clamp keeps `exp` from overflowing.
+- `Softmax`: `e^v / sum(e^row)`, turning each row into probabilities that sum to 1.
+  It's usually used on the output layer. Softmax needs the whole row, not one value,
+  so the dense shader writes raw values and a second dispatch (`shader_softmax.wgsl`)
+  normalizes each row in place, still within the same submission. It subtracts the
+  row's maximum before `exp`, so it can't overflow.
 
 - `Mlp::new` checks that the layer shapes chain together, then **uploads the
   weights once**. Later inference calls reuse them.
@@ -63,7 +68,7 @@ Vulkan or DirectX 12 drivers.
 
 ```bash
 cargo run                        # 4x4 demo: multiply, add, multiply-add, with timings
-cargo run --release -- mlp       # inference demo: 64 -> 128 -> 128 -> 10, batch 32
+cargo run --release -- mlp       # inference demo: 64 -> 128 -> 128 -> 10 (softmax), batch 32
 cargo run --release -- bench     # naive vs tiled multiply, 64..512
 cargo test                       # GPU and CPU tests
 ```
@@ -103,6 +108,7 @@ src/
   shader_tiled.wgsl     tiled multiply (+ optional D)
   shader_add.wgsl       element-wise add
   shader_dense.wgsl     tiled dense layer: X·W + bias, then none, ReLU or sigmoid
+  shader_softmax.wgsl   row-wise softmax in place, one workgroup per row
 ```
 
 All shaders share one bind-group layout: a uniform with the dimensions, inputs A

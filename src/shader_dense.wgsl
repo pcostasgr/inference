@@ -10,7 +10,9 @@ struct Params {
     M: u32,
     K: u32,
     N: u32,
-    activation: u32, // 0 = none, 1 = ReLU, 2 = sigmoid
+    activation: u32, // 0 = none, 1 = ReLU, 2 = sigmoid,
+                     // 3 = softmax: written raw here, normalized per row by
+                     //     shader_softmax.wgsl in the next dispatch
 }
 
 // Must match SIGMOID_CLAMP in mlp.rs. Beyond +-30 sigmoid is 0 or 1 in f32,

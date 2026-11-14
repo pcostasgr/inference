@@ -30,15 +30,21 @@ type BoxError = Box<dyn std::error::Error>;
 
 /// Activation applied after `X * W + bias`. Values match `params.activation`
 /// in `shader_dense.wgsl`.
+// All variants are API choices; the demo only uses Relu and Softmax, the tests
+// cover the rest.
+#[allow(dead_code)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Activation {
     None = 0,
     Relu = 1,
     /// `1 / (1 + e^-v)`, squashing any value into (0, 1).
-    // Part of the API; only the tests use it so far (the demo uses ReLU).
-    #[allow(dead_code)]
     Sigmoid = 2,
+    /// Row-wise: `e^v / sum(e^row)`, turning each row into probabilities that
+    /// sum to 1. Usually only on the output layer. Unlike the others it needs the
+    /// whole row, so on the GPU it runs as a separate dispatch after the layer
+    /// (`shader_softmax.wgsl`); the dense shader just writes the raw values.
+    Softmax = 3,
 }
 
 /// Sigmoid input is clamped to this range on both GPU and CPU. Outside it the
@@ -52,7 +58,10 @@ impl Activation {
         self as u32
     }
 
-    /// Applies the activation on the CPU (for the reference forward pass).
+    /// Applies an element-wise activation to one value on the CPU.
+    ///
+    /// # Panics
+    /// For `Softmax`, which depends on the whole row: use [`apply_row`](Self::apply_row).
     pub fn apply(self, v: f32) -> f32 {
         match self {
             Activation::None => v,
@@ -60,6 +69,31 @@ impl Activation {
             Activation::Sigmoid => {
                 let v = v.clamp(-SIGMOID_CLAMP, SIGMOID_CLAMP);
                 1.0 / (1.0 + (-v).exp())
+            }
+            Activation::Softmax => panic!("softmax is row-wise; use Activation::apply_row"),
+        }
+    }
+
+    /// Applies the activation to one output row in place on the CPU (the
+    /// reference forward pass). Works for every activation, including softmax.
+    pub fn apply_row(self, row: &mut [f32]) {
+        match self {
+            Activation::Softmax => {
+                // Subtract the max first so exp() stays <= 1 and cannot overflow.
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - max).exp();
+                    sum += *v;
+                }
+                for v in row.iter_mut() {
+                    *v /= sum;
+                }
+            }
+            other => {
+                for v in row.iter_mut() {
+                    *v = other.apply(*v);
+                }
             }
         }
     }
@@ -159,8 +193,9 @@ pub fn cpu_forward(layers: &[DenseLayer], input: &[f32], batch: usize) -> Result
                 for i in 0..k {
                     acc += x[row * k + i] * layer.weights[i * n + col];
                 }
-                y[row * n + col] = layer.activation.apply(acc + layer.bias[col]);
+                y[row * n + col] = acc + layer.bias[col];
             }
+            layer.activation.apply_row(&mut y[row * n..(row + 1) * n]);
         }
         x = y;
     }
@@ -334,14 +369,24 @@ impl<'e> Mlp<'e> {
         engine
             .run_pass(
                 |pass| {
-                    pass.set_pipeline(&engine.dense_pipeline);
                     for (layer, bind_group) in self.layers.iter().zip(&bind_groups) {
                         pass.set_bind_group(0, bind_group, &[]);
+
+                        pass.set_pipeline(&engine.dense_pipeline);
                         pass.dispatch_workgroups(
                             (layer.outputs as u32).div_ceil(WORKGROUP_SIZE),
                             (batch as u32).div_ceil(WORKGROUP_SIZE),
                             1,
                         );
+
+                        // Softmax needs whole rows: the dense shader wrote raw
+                        // values, now normalize them in place, one workgroup per
+                        // row. Same bind group (params + this layer's output);
+                        // wgpu makes it wait for the dense dispatch's writes.
+                        if layer.activation == Activation::Softmax {
+                            pass.set_pipeline(&engine.softmax_pipeline);
+                            pass.dispatch_workgroups(1, batch as u32, 1);
+                        }
                     }
                 },
                 output,
@@ -374,8 +419,9 @@ fn argmax(row: &[f32]) -> usize {
 }
 
 /// `cargo run -- mlp`: builds a small 64 -> 128 -> 128 -> 10 network with fixed
-/// random weights, runs a batch of 32 on the GPU, checks it against the CPU, and
-/// prints timings and the predicted class of the first few rows.
+/// random weights (ReLU hidden layers, softmax output), runs a batch of 32 on the
+/// GPU, checks it against the CPU, and prints timings and the most probable class
+/// of the first few rows.
 pub fn run_demo() -> Result<(), BoxError> {
     use crate::matrix_multiplier::PipelineMode;
     use std::time::Instant;
@@ -383,8 +429,9 @@ pub fn run_demo() -> Result<(), BoxError> {
     const WIDTHS: [usize; 4] = [64, 128, 128, 10];
     const BATCH: usize = 32;
 
-    // ReLU on hidden layers, raw scores (logits) out of the last one.
-    // Weights scaled by 1/sqrt(inputs) so activations stay around 1.
+    // ReLU on hidden layers, softmax on the last one so each row comes out as
+    // 10 class probabilities. Weights scaled by 1/sqrt(inputs) so activations
+    // stay around 1.
     let last = WIDTHS.len() - 2;
     let layers: Vec<DenseLayer> = WIDTHS
         .windows(2)
@@ -398,7 +445,7 @@ pub fn run_demo() -> Result<(), BoxError> {
                 bias: pseudo_random(outputs, seed + 1).iter().map(|v| v * 0.1).collect(),
                 inputs,
                 outputs,
-                activation: if i == last { Activation::None } else { Activation::Relu },
+                activation: if i == last { Activation::Softmax } else { Activation::Relu },
             }
         })
         .collect();
@@ -439,15 +486,16 @@ pub fn run_demo() -> Result<(), BoxError> {
 
     let outputs = net.output_size();
     let output = &runs[1].1.output;
-    println!("\n--- Predicted class (argmax of {outputs} scores), first 8 rows ---");
+    println!("\n--- Predicted class (most probable of {outputs}, after softmax), first 8 rows ---");
     for row in 0..8 {
-        let scores = &output[row * outputs..(row + 1) * outputs];
-        let cpu_scores = &expected[row * outputs..(row + 1) * outputs];
+        let probs = &output[row * outputs..(row + 1) * outputs];
+        let cpu_probs = &expected[row * outputs..(row + 1) * outputs];
         println!(
-            "row {row}: GPU class {}  CPU class {}  (top score {:.4})",
-            argmax(scores),
-            argmax(cpu_scores),
-            scores[argmax(scores)]
+            "row {row}: GPU class {}  CPU class {}  (p = {:.4}, row sums to {:.6})",
+            argmax(probs),
+            argmax(cpu_probs),
+            probs[argmax(probs)],
+            probs.iter().sum::<f32>()
         );
     }
 
@@ -551,9 +599,52 @@ mod tests {
         assert_eq!(Activation::None.shader_code(), 0);
         assert_eq!(Activation::Relu.shader_code(), 1);
         assert_eq!(Activation::Sigmoid.shader_code(), 2);
+        assert_eq!(Activation::Softmax.shader_code(), 3);
         assert_eq!(Activation::Relu.apply(-2.0), 0.0);
         assert_eq!(Activation::Relu.apply(3.0), 3.0);
         assert_eq!(Activation::None.apply(-2.0), -2.0);
+    }
+
+    #[test]
+    fn softmax_cpu_values() {
+        let softmax = |v: &[f32]| {
+            let mut row = v.to_vec();
+            Activation::Softmax.apply_row(&mut row);
+            row
+        };
+
+        // Equal inputs -> uniform probabilities.
+        assert_eq!(softmax(&[2.0, 2.0, 2.0, 2.0]), vec![0.25; 4]);
+        // A single value is certain.
+        assert_eq!(softmax(&[-7.0]), vec![1.0]);
+
+        // Known values: softmax([1,2,3]) = [0.0900, 0.2447, 0.6652].
+        let p = softmax(&[1.0, 2.0, 3.0]);
+        let expected = [0.090_030_57, 0.244_728_48, 0.665_240_9];
+        assert!(p.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-6), "{p:?}");
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+
+        // Shifting a row doesn't change it, and huge values don't overflow
+        // (e^1000 would be inf without the max subtraction).
+        let shifted = softmax(&[1001.0, 1002.0, 1003.0]);
+        assert!(shifted.iter().zip(&p).all(|(a, b)| (a - b).abs() < 1e-6), "{shifted:?}");
+    }
+
+    #[test]
+    fn apply_row_matches_apply_for_elementwise() {
+        let input = [-2.0, -0.5, 0.0, 0.5, 2.0];
+        for act in [Activation::None, Activation::Relu, Activation::Sigmoid] {
+            let mut row = input.to_vec();
+            act.apply_row(&mut row);
+            let expected: Vec<f32> = input.iter().map(|&v| act.apply(v)).collect();
+            assert_eq!(row, expected, "{act:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "row-wise")]
+    fn softmax_apply_single_value_panics() {
+        Activation::Softmax.apply(1.0);
     }
 
     #[test]

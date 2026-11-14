@@ -376,7 +376,12 @@ mod tests {
     /// Random network with the given widths: ReLU on hidden layers, none on the
     /// output. Weights are scaled by 1/sqrt(inputs) so activations stay around 1
     /// through the chain instead of growing layer by layer.
-    fn random_net(widths: &[usize], seed: u32, hidden: mlp::Activation) -> Vec<mlp::DenseLayer> {
+    fn random_net(
+        widths: &[usize],
+        seed: u32,
+        hidden: mlp::Activation,
+        output: mlp::Activation,
+    ) -> Vec<mlp::DenseLayer> {
         let last = widths.len() - 2;
         widths
             .windows(2)
@@ -390,7 +395,7 @@ mod tests {
                     bias: test_matrix(outputs, s + 1),
                     inputs,
                     outputs,
-                    activation: if i == last { mlp::Activation::None } else { hidden },
+                    activation: if i == last { output } else { hidden },
                 }
             })
             .collect()
@@ -406,24 +411,26 @@ mod tests {
         (5, &[7, 130, 1, 20, 9]),
     ];
 
-    /// Every shape, once with ReLU hidden layers and once with sigmoid.
+    /// Every shape with ReLU hidden layers, sigmoid hidden layers, and ReLU hidden
+    /// layers plus a softmax output layer.
     #[test]
     fn mlp_forward_matches_cpu() {
+        use mlp::Activation::{None as Raw, Relu, Sigmoid, Softmax};
         with_engine(PipelineMode::Tiled, |engine| {
-            for hidden in [mlp::Activation::Relu, mlp::Activation::Sigmoid] {
+            for (hidden, output) in [(Relu, Raw), (Sigmoid, Raw), (Relu, Softmax)] {
                 for (i, &(batch, widths)) in MLP_SHAPES.iter().enumerate() {
-                    let layers = random_net(widths, 300 + 50 * i as u32, hidden);
+                    let layers = random_net(widths, 300 + 50 * i as u32, hidden, output);
                     let input = test_matrix(batch * widths[0], 900 + i as u32);
 
                     let expected = mlp::cpu_forward(&layers, &input, batch).unwrap();
                     let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
                     let got = pollster::block_on(net.forward(&input, batch))
-                        .unwrap_or_else(|e| panic!("{hidden:?} {widths:?} batch {batch}: {e}"))
+                        .unwrap_or_else(|e| panic!("{hidden:?}/{output:?} {widths:?} batch {batch}: {e}"))
                         .output;
 
                     assert!(
                         approx_eq(&got, &expected),
-                        "GPU/CPU mismatch for {hidden:?} hidden layers, widths {widths:?}, batch {batch}"
+                        "GPU/CPU mismatch for {hidden:?} hidden / {output:?} output, widths {widths:?}, batch {batch}"
                     );
                 }
             }
@@ -454,6 +461,42 @@ mod tests {
             assert!(approx_eq(&out, &mlp::cpu_forward(&layers, &input, 4).unwrap()), "{out:?}");
             assert!(out[4] > 0.999_999 && out[5] < 1e-6, "large x must saturate: {out:?}");
             assert!(out[6] < 1e-6 && out[7] > 0.999_999, "small x must saturate: {out:?}");
+        });
+    }
+
+    /// Softmax on its own (identity weights, zero bias), so the output is exactly
+    /// softmax(input). Widths cover a single column, fewer columns than the
+    /// 256-thread workgroup, and more (each thread handles several columns).
+    #[test]
+    fn mlp_forward_softmax_rows() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            for width in [1, 10, 300] {
+                let mut layer = identity_layer(width);
+                layer.activation = mlp::Activation::Softmax;
+                let layers = [layer];
+                let net = pollster::block_on(mlp::Mlp::new(engine, &layers)).unwrap();
+
+                // Ordinary values, all-equal values, and values near 1000 that
+                // would overflow exp() without the max subtraction.
+                let batch = 3;
+                let mut input = test_matrix(width, 7 + width as u32);
+                input.extend(vec![4.0; width]);
+                input.extend(test_matrix(width, 8).iter().map(|v| 1000.0 + v));
+
+                let out = pollster::block_on(net.forward(&input, batch)).unwrap().output;
+                let expected = mlp::cpu_forward(&layers, &input, batch).unwrap();
+
+                assert!(out.iter().all(|v| v.is_finite() && *v >= 0.0), "width {width}: {out:?}");
+                for row in out.chunks(width) {
+                    let sum: f32 = row.iter().sum();
+                    assert!((sum - 1.0).abs() < 1e-4, "width {width}: row sums to {sum}");
+                }
+                assert!(approx_eq(&out, &expected), "width {width}: GPU/CPU mismatch");
+                assert!(
+                    out[width..2 * width].iter().all(|&p| (p - 1.0 / width as f32).abs() < 1e-6),
+                    "width {width}: equal inputs must give uniform probabilities"
+                );
+            }
         });
     }
 

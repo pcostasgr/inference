@@ -51,6 +51,8 @@ pub struct MatrixMultiplier {
     add_pipeline: wgpu::ComputePipeline,
     /// Tiled `Y = act(X * W + bias)`; used by [`crate::mlp`].
     pub(crate) dense_pipeline: wgpu::ComputePipeline,
+    /// In-place row-wise softmax, run after a dense layer; used by [`crate::mlp`].
+    pub(crate) softmax_pipeline: wgpu::ComputePipeline,
     /// Shared 5-binding layout: uniform, A, B, C (out), D.
     pub(crate) bind_group_layout: wgpu::BindGroupLayout,
     adapter_info: wgpu::AdapterInfo,
@@ -173,6 +175,12 @@ impl MatrixMultiplier {
             "Dense Layer",
             include_str!("shader_dense.wgsl"),
         );
+        let softmax_pipeline = create_pipeline(
+            &device,
+            &pipeline_layout,
+            "Row Softmax",
+            include_str!("shader_softmax.wgsl"),
+        );
 
         pop_error_scopes(&device).await?;
 
@@ -182,6 +190,7 @@ impl MatrixMultiplier {
             pipeline,
             add_pipeline,
             dense_pipeline,
+            softmax_pipeline,
             bind_group_layout,
             adapter_info,
             query_set,

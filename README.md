@@ -1,0 +1,120 @@
+# inference
+
+GPU matrix math and a small neural-network inference chain in Rust, using
+[wgpu](https://wgpu.rs) compute shaders written in WGSL. It runs on any GPU that
+wgpu supports (Vulkan, DirectX 12 or Metal). It was developed on Windows with an
+AMD Radeon RX 560 and an Intel UHD Graphics 630.
+
+Every GPU result is checked against a plain CPU implementation, and every
+operation can report how long it took, both overall and on the GPU itself.
+
+## What it does
+
+| Operation | API | Shader |
+|---|---|---|
+| Matrix multiply, `C = A·B` | `multiply`, `multiply_timed` | `shader.wgsl` (naive) or `shader_tiled.wgsl` (tiled) |
+| Element-wise add, `C = A + B` | `add`, `add_timed` | `shader_add.wgsl` |
+| Fused multiply-add, `C = A·B + D` | `multiply_add`, `multiply_add_timed` | the multiply shader, with D added in its final write |
+| MLP inference, `Y = act(X·W + b)` per layer | `Mlp::new`, `Mlp::forward` | `shader_dense.wgsl` |
+
+### Matrix engine (`src/matrix_multiplier.rs`)
+
+`MatrixMultiplier` holds the GPU device and the compiled pipelines. You pick a
+multiply kernel when you create it:
+
+- **Naive:** each GPU thread computes one output value straight from global memory.
+- **Tiled:** each 16×16 workgroup first loads tiles of A and B into fast shared
+  memory, then multiplies from there. It reads global memory far less.
+
+Each call uploads the inputs, runs one compute pass and reads the result back.
+The `*_timed` versions also return the on-GPU kernel time, measured with
+timestamp queries when the GPU supports them.
+
+### MLP inference chain (`src/mlp.rs`)
+
+A small multi-layer perceptron. Each layer computes `Y = act(X·W + bias)`, where
+`act` is ReLU or none.
+
+- `Mlp::new` checks that the layer shapes chain together, then **uploads the
+  weights once**. Later inference calls reuse them.
+- `Mlp::forward` runs **every layer in one GPU submission**. Activations
+  alternate between two buffers ("ping-pong"): layer *i* reads one and writes
+  the other. wgpu makes each layer wait for the previous one, and only the final
+  layer's output is read back.
+- `cpu_forward` runs the same network on the CPU, as a reference.
+
+```rust
+let engine = pollster::block_on(MatrixMultiplier::new(PipelineMode::Tiled))?;
+let net = pollster::block_on(Mlp::new(&engine, &layers))?; // weights -> GPU once
+let run = pollster::block_on(net.forward(&input, batch))?; // all layers, one submit
+println!("{:?} on the GPU", run.kernel_time);
+```
+
+## Running it
+
+Requires a recent stable Rust toolchain (edition 2024) and a GPU with
+Vulkan or DirectX 12 drivers.
+
+```bash
+cargo run                        # 4x4 demo: multiply, add, multiply-add, with timings
+cargo run --release -- mlp       # inference demo: 64 -> 128 -> 128 -> 10, batch 32
+cargo run --release -- bench     # naive vs tiled multiply, 64..512
+cargo test                       # GPU and CPU tests
+```
+
+Use `--release` for timings. Unoptimized Rust is slow at the CPU reference loops,
+so debug builds make the CPU look about 40× slower than it is.
+
+The program prints which GPU adapter it picked. It asks for the high-performance
+GPU, so on a machine with integrated and discrete graphics it uses the discrete
+card if that card's driver is working.
+
+## Example results
+
+On a Radeon RX 560, release build, MLP demo (64 → 128 → 128 → 10, batch 32):
+
+| | time |
+|---|---|
+| CPU forward | 0.96 ms |
+| GPU, whole call (upload + 3 layers + readback) | 2.84 ms |
+| GPU, the 3 layers on the device | 0.16 ms |
+
+The GPU does the layer math in a fraction of a millisecond. The ~2.7 ms around it
+is the fixed cost of each call: uploading, submitting, waiting and reading back.
+At this small size, that makes the CPU faster overall. The GPU pulls ahead as the
+batch or the layers grow, because that fixed cost stays the same while the work
+increases.
+
+## Project layout
+
+```
+src/
+  main.rs               entry point, the 4x4 demo, CPU references, GPU tests
+  matrix_multiplier.rs  GPU engine: device, pipelines, run_pass(), multiply/add/madd
+  mlp.rs                MLP types, validation, Mlp::new/forward, cpu_forward, mlp demo
+  bench.rs              naive vs tiled multiply benchmark
+  shader.wgsl           naive multiply (+ optional D)
+  shader_tiled.wgsl     tiled multiply (+ optional D)
+  shader_add.wgsl       element-wise add
+  shader_dense.wgsl     tiled dense layer: X·W + bias, then ReLU or none
+```
+
+All shaders share one bind-group layout: a uniform with the dimensions, inputs A
+and B, output C, and an optional fourth matrix D (the bias, for dense layers).
+The 16×16 workgroup size is defined once in Rust (`WORKGROUP_SIZE`) and injected
+into every shader as `BLOCK_SIZE`.
+
+## Limits and notes
+
+- **Matrix size:** every dimension is limited to 4096 (`MAX_DIMENSION`), so one
+  f32 matrix is at most 64 MB. That fits the default 128 MB storage-buffer limit.
+- **Long dispatches:** a large multiply, especially with the naive kernel on an
+  integrated GPU, can run long enough to trigger the Windows GPU timeout (TDR).
+  The benchmark stops at 512×512 for this reason.
+- **Precision:** the GPU sums dot products in a different order than the CPU,
+  so results are compared with a relative tolerance, not for exact equality.
+- **One GPU device at a time:** the GPU tests share a lock (`GPU_LOCK`), so only
+  one wgpu device exists at once even though `cargo test` runs tests in parallel.
+  Opening several devices at once crashed the test machine.
+- **Kernel timing** needs the `TIMESTAMP_QUERY` feature. Without it,
+  `kernel_time` is `None` and only wall-clock times are shown.

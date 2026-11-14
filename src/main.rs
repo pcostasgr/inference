@@ -21,6 +21,10 @@ fn cpu_matrix_multiply(a: &[f32], b: &[f32], m: usize, k_dim: usize, n: usize) -
     c
 }
 
+fn cpu_matrix_add(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b).map(|(x, y)| x + y).collect()
+}
+
 /// Compares with a tolerance relative to each value's magnitude, since GPU and CPU
 /// accumulate in different orders and f32 error grows with K and value size.
 fn approx_eq(gpu: &[f32], cpu: &[f32]) -> bool {
@@ -105,7 +109,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(t) => println!("GPU kernel (on-device): {:>10.3} ms", ms(t)),
         None => println!("GPU kernel (on-device):        n/a  (adapter lacks TIMESTAMP_QUERY)"),
     }
-    println!("Run `cargo run --release -- bench` to time larger matrices.");
+
+    // --- Element-wise addition: C = A + B (both m x n here, since A and B are square) ---
+    let cpu_add_start = Instant::now();
+    let cpu_sum = cpu_matrix_add(&matrix_a, &matrix_b);
+    let cpu_add_time = cpu_add_start.elapsed();
+
+    let gpu_add_start = Instant::now();
+    let add_run = pollster::block_on(engine.add_timed(&matrix_a, &matrix_b, m, n))?;
+    let gpu_add_wall = gpu_add_start.elapsed();
+
+    println!("\n--- GPU Result A + B ---");
+    print_matrix(&add_run.output, m, n);
+
+    if !approx_eq(&add_run.output, &cpu_sum) {
+        return Err("Addition failed verification: GPU result differs from CPU".into());
+    }
+    println!("\nSUCCESS: GPU addition matches CPU calculation!");
+
+    println!("\n--- Addition Timing ---");
+    println!("CPU add:                {:>10.3} ms", ms(cpu_add_time));
+    println!("GPU total (wall):       {:>10.3} ms  (upload + dispatch + readback)", ms(gpu_add_wall));
+    match add_run.kernel_time {
+        Some(t) => println!("GPU kernel (on-device): {:>10.3} ms", ms(t)),
+        None => println!("GPU kernel (on-device):        n/a  (adapter lacks TIMESTAMP_QUERY)"),
+    }
+
+    println!("\nRun `cargo run --release -- bench` to time larger matrices.");
 
     Ok(())
 }
@@ -173,6 +203,34 @@ mod tests {
     #[test]
     fn tiled_matches_cpu() {
         check_mode(PipelineMode::Tiled);
+    }
+
+    /// Addition shapes: single element, exact tile, partial tiles, thin rows/columns.
+    const ADD_SHAPES: &[(usize, usize)] = &[(1, 1), (16, 16), (17, 33), (1, 300), (300, 1), (100, 70)];
+
+    #[test]
+    fn add_matches_cpu() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            for (i, &(rows, cols)) in ADD_SHAPES.iter().enumerate() {
+                let a = test_matrix(rows * cols, 100 + 2 * i as u32);
+                let b = test_matrix(rows * cols, 101 + 2 * i as u32);
+                let got = pollster::block_on(engine.add(&a, &b, rows, cols))
+                    .unwrap_or_else(|e| panic!("add {rows}x{cols}: {e}"));
+                // Each element is a single f32 add, so GPU and CPU must agree exactly.
+                assert_eq!(got, cpu_matrix_add(&a, &b), "add mismatch for {rows}x{cols}");
+            }
+        });
+    }
+
+    #[test]
+    fn add_rejects_bad_input() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            let four = [1.0f32; 4];
+            let three = [1.0f32; 3];
+            assert!(pollster::block_on(engine.add(&four, &four, 0, 4)).is_err());
+            assert!(pollster::block_on(engine.add(&four, &three, 2, 2)).is_err());
+            assert!(pollster::block_on(engine.add(&four, &four, MAX_DIMENSION + 1, 1)).is_err());
+        });
     }
 
     #[test]

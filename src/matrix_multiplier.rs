@@ -41,11 +41,13 @@ pub struct GpuRun {
     pub kernel_time: Option<Duration>,
 }
 
-/// Reusable GPU engine that holds the GPU device, queue, and a single chosen compute pipeline.
+/// Reusable GPU engine that holds the GPU device, queue, the chosen multiply
+/// pipeline and an element-wise addition pipeline.
 pub struct MatrixMultiplier {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    add_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     adapter_info: wgpu::AdapterInfo,
     /// Two-entry timestamp query set (pass begin/end), if supported.
@@ -122,17 +124,11 @@ impl MatrixMultiplier {
         });
 
         let (label, body) = match mode {
-            PipelineMode::Naive => ("Naive Matrix Multiply Shader", include_str!("shader.wgsl")),
-            PipelineMode::Tiled => ("Tiled Matrix Multiply Shader", include_str!("shader_tiled.wgsl")),
+            PipelineMode::Naive => ("Naive Matrix Multiply", include_str!("shader.wgsl")),
+            PipelineMode::Tiled => ("Tiled Matrix Multiply", include_str!("shader_tiled.wgsl")),
         };
-        let shader_source = format!("const BLOCK_SIZE: u32 = {WORKGROUP_SIZE}u;\n{body}");
 
         push_error_scopes(&device);
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Compute Bind Group Layout"),
@@ -159,14 +155,13 @@ impl MatrixMultiplier {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline = create_pipeline(&device, &pipeline_layout, label, body);
+        let add_pipeline = create_pipeline(
+            &device,
+            &pipeline_layout,
+            "Matrix Add",
+            include_str!("shader_add.wgsl"),
+        );
 
         pop_error_scopes(&device).await?;
 
@@ -174,6 +169,7 @@ impl MatrixMultiplier {
             device,
             queue,
             pipeline,
+            add_pipeline,
             bind_group_layout,
             adapter_info,
             query_set,
@@ -250,6 +246,72 @@ impl MatrixMultiplier {
             _pad: 0,
         };
 
+        self.dispatch(&self.pipeline, dims, matrix_a, matrix_b).await
+    }
+
+    /// Adds two `rows x cols` matrices element-wise on the GPU: C = A + B.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn add(
+        &self,
+        matrix_a: &[f32],
+        matrix_b: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>, BoxError> {
+        Ok(self.add_timed(matrix_a, matrix_b, rows, cols).await?.output)
+    }
+
+    /// Like [`add`](Self::add), but also returns the GPU kernel time.
+    pub async fn add_timed(
+        &self,
+        matrix_a: &[f32],
+        matrix_b: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<GpuRun, BoxError> {
+        if rows == 0 || cols == 0 {
+            return Err("Matrix dimensions must be non-zero".into());
+        }
+
+        if rows > MAX_DIMENSION || cols > MAX_DIMENSION {
+            return Err(format!(
+                "Dimension exceeds MAX_DIMENSION ({MAX_DIMENSION}): rows={rows}, cols={cols}"
+            )
+            .into());
+        }
+
+        let len = rows * cols;
+        if matrix_a.len() != len || matrix_b.len() != len {
+            return Err(format!(
+                "Slice lengths (A={}, B={}) must both equal rows * cols ({rows} * {cols} = {len})",
+                matrix_a.len(),
+                matrix_b.len()
+            )
+            .into());
+        }
+
+        // k is unused by the add shader; dispatch only reads m (rows) and n (cols).
+        let dims = Dimensions {
+            m: rows as u32,
+            k: 0,
+            n: cols as u32,
+            _pad: 0,
+        };
+
+        self.dispatch(&self.add_pipeline, dims, matrix_a, matrix_b).await
+    }
+
+    /// Uploads A and B, runs `pipeline` over an `m x n` output grid, and reads C back.
+    /// Inputs must already be validated against `dims`.
+    async fn dispatch(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        dims: Dimensions,
+        matrix_a: &[f32],
+        matrix_b: &[f32],
+    ) -> Result<GpuRun, BoxError> {
+        let (m, n) = (dims.m as usize, dims.n as usize);
+
         push_error_scopes(&self.device);
 
         let dims_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -310,11 +372,11 @@ impl MatrixMultiplier {
                         end_of_pass_write_index: Some(1),
                     });
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Matrix Multiply Pass"),
+                label: Some("Matrix Compute Pass"),
                 timestamp_writes,
             });
 
-            compute_pass.set_pipeline(&self.pipeline);
+            compute_pass.set_pipeline(pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
 
             let workgroups_x = dims.n.div_ceil(WORKGROUP_SIZE);
@@ -370,7 +432,29 @@ impl MatrixMultiplier {
     }
 }
 
-type MapReceiver = std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>;
+/// Compiles a WGSL compute shader (with `BLOCK_SIZE` injected) into a pipeline.
+fn create_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    label: &str,
+    body: &str,
+) -> wgpu::ComputePipeline {
+    let source = format!("const BLOCK_SIZE: u32 = {WORKGROUP_SIZE}u;\n{body}");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+type MapReceiver =std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>;
 
 /// Starts mapping the whole buffer for reading; completes on the next `device.poll`.
 fn map_read(buffer: &wgpu::Buffer) -> MapReceiver {

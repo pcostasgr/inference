@@ -59,6 +59,7 @@ fn print_matrix(mat: &[f32], rows: usize, cols: usize) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("bench") => return bench::run(),
+        Some("swizzle") => return bench::run_swizzle_ab(),
         Some("mlp") => return mlp::run_demo(),
         _ => {}
     }
@@ -206,17 +207,18 @@ mod tests {
         (64, 130, 31),
     ];
 
-    /// Only one GPU device may exist at a time: opening several at once
-    /// (cargo runs tests in parallel threads) crashes the Intel UHD 630 driver.
+    /// Only one GPU device may exist at a time. Parallel test runs that each
+    /// opened their own device coincided with blue screens on the test machine
+    /// (cause unconfirmed); this keeps it to one device as a precaution.
     static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Runs `f` with a fresh engine while holding [`GPU_LOCK`]; the engine
     /// (and its device) is dropped before the lock is released.
-    fn with_engine(mode: PipelineMode, f: impl FnOnce(&MatrixMultiplier)) {
+    fn with_engine(mode: PipelineMode, f: impl FnOnce(&mut MatrixMultiplier)) {
         // A panicking test poisons the lock; the GPU is still usable afterwards.
         let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let engine = pollster::block_on(MatrixMultiplier::new(mode)).expect("GPU init failed");
-        f(&engine);
+        let mut engine = pollster::block_on(MatrixMultiplier::new(mode)).expect("GPU init failed");
+        f(&mut engine);
     }
 
     fn check_mode(mode: PipelineMode) {
@@ -242,6 +244,29 @@ mod tests {
         check_mode(PipelineMode::Tiled);
     }
 
+    #[test]
+    fn tiled_swizzled_matches_cpu() {
+        check_mode(PipelineMode::TiledSwizzled);
+    }
+
+    /// The swizzle only changes where values sit in shared memory, not the
+    /// order they're summed, so it must give bit-identical results.
+    #[test]
+    fn swizzle_is_bit_identical_to_plain_tiled() {
+        with_engine(PipelineMode::Tiled, |engine| {
+            for (i, &(m, k, n)) in SHAPES.iter().enumerate() {
+                let a = test_matrix(m * k, 700 + 2 * i as u32);
+                let b = test_matrix(k * n, 701 + 2 * i as u32);
+                engine.set_mode(PipelineMode::Tiled);
+                let plain = pollster::block_on(engine.multiply(&a, &b, m, k, n)).unwrap();
+                engine.set_mode(PipelineMode::TiledSwizzled);
+                let swizzled = pollster::block_on(engine.multiply(&a, &b, m, k, n)).unwrap();
+                assert_eq!(engine.mode(), PipelineMode::TiledSwizzled);
+                assert_eq!(swizzled, plain, "swizzle changed the result for {m}x{k}x{n}");
+            }
+        });
+    }
+
     fn check_madd(mode: PipelineMode) {
         with_engine(mode, |engine| {
             for (i, &(m, k, n)) in SHAPES.iter().enumerate() {
@@ -264,6 +289,11 @@ mod tests {
     #[test]
     fn tiled_madd_matches_cpu() {
         check_madd(PipelineMode::Tiled);
+    }
+
+    #[test]
+    fn tiled_swizzled_madd_matches_cpu() {
+        check_madd(PipelineMode::TiledSwizzled);
     }
 
     #[test]

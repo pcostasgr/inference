@@ -18,6 +18,9 @@ pub const MAX_DIMENSION: usize = 4096;
 /// `max_compute_invocations_per_workgroup` is 256.
 pub const WORKGROUP_SIZE: u32 = 16;
 const _: () = assert!(WORKGROUP_SIZE * WORKGROUP_SIZE <= 256);
+// The tiled shader's XOR swizzle (c ^ r) only permutes a row's columns when
+// the tile width is a power of two.
+const _: () = assert!(WORKGROUP_SIZE.is_power_of_two());
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -29,12 +32,24 @@ struct Dimensions {
     has_d: u32,
 }
 
-/// Pipeline mode selected by the caller
+/// Which matrix-multiply kernel to use.
 #[allow(dead_code)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PipelineMode {
+    /// One thread per output, straight from global memory (`shader.wgsl`).
     Naive,
+    /// 16x16 tiles in shared memory (`shader_tiled.wgsl`, SWIZZLE = false).
     Tiled,
+    /// Same as `Tiled`, with XOR-swizzled tile storage to avoid shared-memory
+    /// bank conflicts (`shader_tiled.wgsl`, SWIZZLE = true). Kept for
+    /// experiments: this kernel has no bank conflicts to remove, and on a
+    /// Radeon RX 560 it measured 9-25% slower than `Tiled`
+    /// (`cargo run --release -- swizzle`).
+    TiledSwizzled,
+}
+
+impl PipelineMode {
+    pub const ALL: [PipelineMode; 3] = [PipelineMode::Naive, PipelineMode::Tiled, PipelineMode::TiledSwizzled];
 }
 
 type BoxError = Box<dyn std::error::Error>;
@@ -54,7 +69,12 @@ pub struct GpuRun {
 pub struct MatrixMultiplier {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
+    /// One multiply pipeline per `PipelineMode`, indexed by `mode as usize`.
+    /// All are compiled up front (they're small) so `set_mode` can switch
+    /// between them on the same device, e.g. for A/B benchmarks.
+    multiply_pipelines: [wgpu::ComputePipeline; 3],
+    /// The multiply kernel `multiply` / `multiply_add` use.
+    mode: PipelineMode,
     add_pipeline: wgpu::ComputePipeline,
     /// Layout for multiply / add: uniform, A, B, C (out), D.
     bind_group_layout: wgpu::BindGroupLayout,
@@ -114,8 +134,9 @@ pub(crate) async fn pop_error_scopes(device: &wgpu::Device) -> Result<(), BoxErr
 }
 
 impl MatrixMultiplier {
-    /// Initializes the GPU context and compiles the pipelines: the multiply
-    /// kernel selected by `mode`, plus add, dense layer and softmax.
+    /// Initializes the GPU context and compiles the pipelines: every multiply
+    /// kernel (`mode` picks the one used; see [`set_mode`](Self::set_mode)),
+    /// plus add, dense layer and softmax.
     pub async fn new(mode: PipelineMode) -> Result<Self, BoxError> {
         let instance = wgpu::Instance::default();
 
@@ -154,11 +175,6 @@ impl MatrixMultiplier {
             })
         });
 
-        let (label, body) = match mode {
-            PipelineMode::Naive => ("Naive Matrix Multiply", include_str!("shader.wgsl")),
-            PipelineMode::Tiled => ("Tiled Matrix Multiply", include_str!("shader_tiled.wgsl")),
-        };
-
         push_error_scopes(&device);
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -178,7 +194,30 @@ impl MatrixMultiplier {
             push_constant_ranges: &[],
         });
 
-        let pipeline = create_pipeline(&device, &pipeline_layout, label, body);
+        // One pipeline per PipelineMode, in enum order. The two tiled variants
+        // are the same shader with SWIZZLE injected as false / true.
+        let tiled = include_str!("shader_tiled.wgsl");
+        let multiply_pipelines = PipelineMode::ALL.map(|m| match m {
+            PipelineMode::Naive => create_pipeline(
+                &device,
+                &pipeline_layout,
+                "Naive Matrix Multiply",
+                include_str!("shader.wgsl"),
+            ),
+            PipelineMode::Tiled => create_pipeline(
+                &device,
+                &pipeline_layout,
+                "Tiled Matrix Multiply",
+                &format!("const SWIZZLE: bool = false;\n{tiled}"),
+            ),
+            PipelineMode::TiledSwizzled => create_pipeline(
+                &device,
+                &pipeline_layout,
+                "Tiled Matrix Multiply (XOR swizzle)",
+                &format!("const SWIZZLE: bool = true;\n{tiled}"),
+            ),
+        });
+
         let add_pipeline = create_pipeline(
             &device,
             &pipeline_layout,
@@ -227,7 +266,8 @@ impl MatrixMultiplier {
         Ok(Self {
             device,
             queue,
-            pipeline,
+            multiply_pipelines,
+            mode,
             add_pipeline,
             bind_group_layout,
             act_layout,
@@ -242,6 +282,18 @@ impl MatrixMultiplier {
     /// Information about the GPU adapter this engine runs on.
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
+    }
+
+    /// The multiply kernel `multiply` / `multiply_add` currently use.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn mode(&self) -> PipelineMode {
+        self.mode
+    }
+
+    /// Switches the multiply kernel. All kernels were compiled in `new`, so
+    /// this is free and stays on the same device.
+    pub fn set_mode(&mut self, mode: PipelineMode) {
+        self.mode = mode;
     }
 
     /// Whether operations can report on-GPU time (`GpuRun::kernel_time`).
@@ -364,7 +416,7 @@ impl MatrixMultiplier {
             has_d: matrix_d.is_some() as u32,
         };
 
-        self.dispatch(&self.pipeline, dims, matrix_a, matrix_b, matrix_d)
+        self.dispatch(&self.multiply_pipelines[self.mode as usize], dims, matrix_a, matrix_b, matrix_d)
             .await
     }
 

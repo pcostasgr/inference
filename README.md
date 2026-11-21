@@ -19,12 +19,19 @@ operation can report how long it took, both overall and on the GPU itself.
 
 ### Matrix engine (`src/matrix_multiplier.rs`)
 
-`MatrixMultiplier` holds the GPU device and the compiled pipelines. You pick a
-multiply kernel when you create it:
+`MatrixMultiplier` holds the GPU device and the compiled pipelines. All multiply
+kernels are compiled up front. You pick one when you create the engine, and
+`set_mode` switches between them on the same device:
 
 - **Naive:** each GPU thread computes one output value straight from global memory.
 - **Tiled:** each 16×16 workgroup first loads tiles of A and B into fast shared
   memory, then multiplies from there. It reads global memory far less.
+- **TiledSwizzled:** the tiled kernel with XOR-swizzled tile storage
+  (element (r, c) stored at column `c ^ r`), a standard trick for avoiding
+  shared-memory bank conflicts. It's kept as an experiment: this kernel's reads
+  were already conflict-free, so the swizzle only adds index math to the inner
+  loop. On a Radeon RX 560 it measured **9–25% slower** than `Tiled` (see
+  "Measuring kernel changes" below).
 
 Each call uploads the inputs, runs one compute pass and reads the result back.
 The `*_timed` versions also return the on-GPU kernel time, measured with
@@ -92,7 +99,8 @@ Vulkan or DirectX 12 drivers.
 ```bash
 cargo run                        # 4x4 demo: multiply, add, multiply-add, with timings
 cargo run --release -- mlp       # inference demo: 64 -> 128 -> 128 -> 10 (softmax), batch 32
-cargo run --release -- bench     # naive vs tiled multiply, 64..512
+cargo run --release -- bench     # every multiply kernel, 64..512
+cargo run --release -- swizzle   # A/B test: swizzled vs plain tiled kernel
 cargo test                       # GPU and CPU tests
 ```
 
@@ -120,6 +128,33 @@ At this small size, that makes the CPU faster overall. The GPU pulls ahead as th
 batch or the layers grow, because that fixed cost stays the same while the work
 increases.
 
+## Measuring kernel changes
+
+GPU clocks change between runs, so separate `bench` runs of the same code can
+disagree by up to 2×. That's too noisy to judge a kernel tweak.
+`cargo run --release -- swizzle` measures the swizzled kernel against the plain
+one properly:
+
+- **Paired rounds:** each round runs both kernels back to back on the same
+  device and records their ratio, so both see the same clock state.
+- **Alternating order:** plain first in one round, swizzled first in the next.
+- **Volume:** 60 rounds per size after 5 warm-up rounds, timed on the GPU.
+- **A/A control:** the plain kernel against itself, with the same procedure.
+  Its ratio shows the noise floor. A difference only counts if it's larger
+  than that and its middle 50% is entirely on one side of 1.0.
+
+Result on a Radeon RX 560 (ratio < 1 would mean the swizzle is faster):
+
+| N | swizzle / plain [25th–75th percentile] | A/A control | verdict |
+|---|---|---|---|
+| 64 | 1.176 [1.100–1.204] | 1.004 [0.993–1.022] | 18% slower |
+| 128 | 1.105 [1.084–1.177] | 0.997 [0.992–1.003] | 10% slower |
+| 256 | 1.090 [1.085–1.098] | 0.999 [0.994–1.003] | 9% slower |
+| 512 | 1.249 [1.212–1.281] | 1.000 [0.999–1.002] | 25% slower |
+
+To test another kernel change the same way, add it as a `PipelineMode` and
+call `paired()` in `src/bench.rs` with the two modes.
+
 ## Project layout
 
 ```
@@ -129,7 +164,7 @@ src/
   mlp.rs                MLP types, validation, Mlp::new/forward, cpu_forward, mlp demo
   bench.rs              naive vs tiled multiply benchmark
   shader.wgsl           naive multiply (+ optional D)
-  shader_tiled.wgsl     tiled multiply (+ optional D)
+  shader_tiled.wgsl     tiled multiply (+ optional D, + optional XOR swizzle)
   shader_add.wgsl       element-wise add
   shader_dense.wgsl     tiled dense layer: X·W + bias, then none, ReLU or sigmoid
   shader_softmax.wgsl   row-wise softmax in place, one workgroup per row
